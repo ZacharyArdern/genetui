@@ -62,4 +62,4 @@ Requires Rust 1.70+. The `rust-htslib` dependency needs `htslib` headers (`brew 
 | Custom gene plot | [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer) | Publication-quality genomic figures (Python, runs via Pyodide) |
 | Python in browser | [Pyodide](https://pyodide.org) | CPython compiled to WASM; runs dna_features_viewer client-side |
 | Structure viewer | [3Dmol.js](https://3dmol.csb.pitt.edu) | WebGL molecular visualisation |
-| Local protein folding | [minifold-mlx](https://github.com/mhaukness-ucsc/minifold) | Lightweight folding based on [MiniFold](https://github.com/EricAlcaide/MiniFold) by Jeremy Wohlwend & Eric Alcaide; MLX port for Apple Silicon |
+| Local protein folding | [minifold-mlx](https://github.com/ZacharyArdern/MiniFold-MLX/) | Lightweight folding based on [MiniFold](https://github.com/EricAlcaide/MiniFold) by Jeremy Wohlwend & Eric Alcaide; MLX port for Apple Silicon |
