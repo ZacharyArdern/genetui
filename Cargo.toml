@@ -1,0 +1,33 @@
+[package]
+name = "genetui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "genetui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "genetui"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+regex = "1"
+flate2 = "1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rust-htslib = "1.0.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = "0.3.32"

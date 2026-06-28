@@ -1,0 +1,4 @@
+/target
+*.pdb
+minifold_predictions/
+genetui_screenshot.png

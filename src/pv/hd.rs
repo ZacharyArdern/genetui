@@ -1,0 +1,290 @@
+use crate::pv::camera::Camera;
+use crate::pv::color::ColorScheme;
+use crate::pv::framebuffer::{Framebuffer, default_light_dir};
+use crate::pv::ribbon::RibbonTriangle;
+use rayon::prelude::*;
+
+/// Render the protein into a raw [`Framebuffer`] at the given pixel dimensions.
+pub fn render_hd_framebuffer(
+    _protein: &crate::pv::Protein,
+    camera: &Camera,
+    _color_scheme: &ColorScheme,
+    width: f64,
+    height: f64,
+    mesh: &[RibbonTriangle],
+) -> Framebuffer {
+    let px_w = width as usize;
+    let px_h = height as usize;
+    if px_w == 0 || px_h == 0 {
+        return Framebuffer::new(1, 1);
+    }
+
+    let mut fb = Framebuffer::new(px_w, px_h);
+    let light_dir = default_light_dir();
+    let half_w = px_w as f64 / 2.0;
+    let half_h = px_h as f64 / 2.0;
+
+    // Pre-compute sin/cos once for the entire frame instead of per-vertex.
+    let cache = camera.projection_cache();
+
+    let ctx = TiledRenderCtx {
+        half_w,
+        half_h,
+        px_w,
+        px_h,
+        light_dir,
+    };
+    render_cartoon_tiled(&mut fb, mesh, &cache, &ctx);
+
+    // Post-pass: blend all rasterized pixels toward a cool blue-gray fog color
+    // based on their z-buffer depth.
+    fb.apply_depth_tint([40, 50, 70], 0.35);
+
+    fb
+}
+
+/// Convert projected coords (centered at origin) to pixel coords (top-left origin).
+#[inline]
+fn to_pixel(proj_x: f64, proj_y: f64, proj_z: f64, half_w: f64, half_h: f64) -> [f64; 3] {
+    [proj_x + half_w, half_h - proj_y, proj_z]
+}
+
+// ---------------------------------------------------------------------------
+// Tile-based parallel cartoon rasterization
+// ---------------------------------------------------------------------------
+
+/// Tile size in pixels.  64x64 is a good balance between parallelism (many
+/// tiles) and per-tile overhead (triangle binning, allocation).
+const TILE_SIZE: usize = 64;
+
+/// A projected, shaded triangle ready for rasterization into tiles.
+struct ProjectedTriangle {
+    /// Screen-space vertices `[x, y, z]`.
+    verts: [[f64; 3]; 3],
+    /// Pre-computed flat-shaded color (Lambert applied).
+    shaded: [u8; 3],
+    /// Screen-space bounding box (clamped to framebuffer).
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+}
+
+/// Context for tile-based cartoon rasterization, reducing parameter count.
+struct TiledRenderCtx {
+    half_w: f64,
+    half_h: f64,
+    px_w: usize,
+    px_h: usize,
+    light_dir: [f64; 3],
+}
+
+/// A rasterized tile with its position, dimensions, and pixel data.
+struct RenderedTile {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: Vec<[u8; 3]>,
+    depth: Vec<f32>,
+}
+
+/// Render the cartoon mesh using tile-based parallel rasterization.
+fn render_cartoon_tiled(
+    fb: &mut Framebuffer,
+    mesh: &[RibbonTriangle],
+    cache: &crate::pv::camera::ProjectionCache,
+    ctx: &TiledRenderCtx,
+) {
+    const AMBIENT: f64 = 0.55;
+    let half_w = ctx.half_w;
+    let half_h = ctx.half_h;
+    let px_w = ctx.px_w;
+    let px_h = ctx.px_h;
+    let light_dir = ctx.light_dir;
+
+    // ------------------------------------------------------------------
+    // Step 1: Project and shade all triangles (serial).
+    // ------------------------------------------------------------------
+    let projected: Vec<ProjectedTriangle> = mesh
+        .iter()
+        .filter_map(|tri| {
+            let v0 = cache.project(tri.verts[0][0], tri.verts[0][1], tri.verts[0][2]);
+            let v1 = cache.project(tri.verts[1][0], tri.verts[1][1], tri.verts[1][2]);
+            let v2 = cache.project(tri.verts[2][0], tri.verts[2][1], tri.verts[2][2]);
+
+            let sv0 = to_pixel(v0.x, v0.y, v0.z, half_w, half_h);
+            let sv1 = to_pixel(v1.x, v1.y, v1.z, half_w, half_h);
+            let sv2 = to_pixel(v2.x, v2.y, v2.z, half_w, half_h);
+
+            // Screen-space bounding box clamped to framebuffer.
+            let fmin_x = sv0[0].min(sv1[0]).min(sv2[0]).floor() as isize;
+            let fmax_x = sv0[0].max(sv1[0]).max(sv2[0]).ceil() as isize;
+            let fmin_y = sv0[1].min(sv1[1]).min(sv2[1]).floor() as isize;
+            let fmax_y = sv0[1].max(sv1[1]).max(sv2[1]).ceil() as isize;
+
+            let min_x = fmin_x.max(0) as usize;
+            let max_x = (fmax_x.max(0) as usize).min(px_w.saturating_sub(1));
+            let min_y = fmin_y.max(0) as usize;
+            let max_y = (fmax_y.max(0) as usize).min(px_h.saturating_sub(1));
+
+            if min_x > max_x || min_y > max_y {
+                return None;
+            }
+
+            // Two-sided half-Lambert shading.
+            let rn = cache.rotate_normal(tri.normal[0], tri.normal[1], tri.normal[2]);
+            let dot = rn[0] * light_dir[0] + rn[1] * light_dir[1] + rn[2] * light_dir[2];
+            let half_lambert = dot.abs() * 0.4 + 0.6;
+            let intensity = AMBIENT + (1.0 - AMBIENT) * half_lambert;
+            let shaded: [u8; 3] = [
+                (tri.color[0] as f64 * intensity).min(255.0) as u8,
+                (tri.color[1] as f64 * intensity).min(255.0) as u8,
+                (tri.color[2] as f64 * intensity).min(255.0) as u8,
+            ];
+
+            Some(ProjectedTriangle {
+                verts: [sv0, sv1, sv2],
+                shaded,
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            })
+        })
+        .collect();
+
+    if projected.is_empty() {
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2: Create tile grid and bin triangles into tiles.
+    // ------------------------------------------------------------------
+    let cols = px_w.div_ceil(TILE_SIZE);
+    let rows = px_h.div_ceil(TILE_SIZE);
+    let num_tiles = cols * rows;
+    let mut tile_triangles: Vec<Vec<usize>> = vec![Vec::new(); num_tiles];
+
+    for (tri_idx, tri) in projected.iter().enumerate() {
+        let tc0 = tri.min_x / TILE_SIZE;
+        let tc1 = tri.max_x / TILE_SIZE;
+        let tr0 = tri.min_y / TILE_SIZE;
+        let tr1 = tri.max_y / TILE_SIZE;
+        for tr in tr0..=tr1 {
+            for tc in tc0..=tc1 {
+                tile_triangles[tr * cols + tc].push(tri_idx);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 3: Rasterize tiles in parallel.
+    // ------------------------------------------------------------------
+    let tiles: Vec<RenderedTile> = tile_triangles
+        .into_par_iter()
+        .enumerate()
+        .map(|(tile_idx, tri_indices)| {
+            let tx = (tile_idx % cols) * TILE_SIZE;
+            let ty = (tile_idx / cols) * TILE_SIZE;
+            let tw = TILE_SIZE.min(px_w.saturating_sub(tx));
+            let th = TILE_SIZE.min(px_h.saturating_sub(ty));
+
+            let mut color = vec![[0u8; 3]; tw * th];
+            let mut depth = vec![f32::INFINITY; tw * th];
+
+            for &tri_idx in &tri_indices {
+                let tri = &projected[tri_idx];
+                rasterize_into_tile(&mut color, &mut depth, tw, th, tx, ty, tri);
+            }
+
+            RenderedTile {
+                x: tx,
+                y: ty,
+                w: tw,
+                h: th,
+                color,
+                depth,
+            }
+        })
+        .collect();
+
+    // ------------------------------------------------------------------
+    // Step 4: Merge tiles back into the main framebuffer.
+    // ------------------------------------------------------------------
+    for tile in &tiles {
+        for ly in 0..tile.h {
+            for lx in 0..tile.w {
+                let ti = ly * tile.w + lx;
+                let fi = (tile.y + ly) * px_w + (tile.x + lx);
+                if tile.depth[ti] < fb.depth[fi] {
+                    fb.color[fi] = tile.color[ti];
+                    fb.depth[fi] = tile.depth[ti];
+                }
+            }
+        }
+    }
+}
+
+/// Rasterize a single projected triangle into a tile's local buffers.
+#[inline]
+fn rasterize_into_tile(
+    color: &mut [[u8; 3]],
+    depth: &mut [f32],
+    tw: usize,
+    th: usize,
+    tx: usize,
+    ty: usize,
+    tri: &ProjectedTriangle,
+) {
+    let [v0, v1, v2] = tri.verts;
+
+    // Clamp the triangle's bounding box to this tile.
+    let min_x = tri.min_x.max(tx);
+    let max_x = tri.max_x.min((tx + tw).saturating_sub(1));
+    let min_y = tri.min_y.max(ty);
+    let max_y = tri.max_y.min((ty + th).saturating_sub(1));
+
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    // Barycentric denominator.
+    let denom = (v1[1] - v2[1]) * (v0[0] - v2[0]) + (v2[0] - v1[0]) * (v0[1] - v2[1]);
+    if denom.abs() < 1e-12 {
+        return; // degenerate triangle
+    }
+    let inv_denom = 1.0 / denom;
+
+    let u_x_step = (v1[1] - v2[1]) * inv_denom;
+    let v_x_step = (v2[1] - v0[1]) * inv_denom;
+    let u_y_coeff = (v2[0] - v1[0]) * inv_denom;
+    let v_y_coeff = (v0[0] - v2[0]) * inv_denom;
+
+    for py in min_y..=max_y {
+        let pf_y = py as f64 + 0.5;
+        let dy = pf_y - v2[1];
+        let u_y = u_y_coeff * dy;
+        let v_y = v_y_coeff * dy;
+
+        for px in min_x..=max_x {
+            let pf_x = px as f64 + 0.5;
+            let dx = pf_x - v2[0];
+
+            let u = u_x_step * dx + u_y;
+            let v = v_x_step * dx + v_y;
+            let w = 1.0 - u - v;
+
+            if u >= -1e-6 && v >= -1e-6 && w >= -1e-6 {
+                let z = (u * v0[2] + v * v1[2] + w * v2[2]) as f32;
+                let lx = px - tx;
+                let ly = py - ty;
+                let ti = ly * tw + lx;
+                if z < depth[ti] {
+                    depth[ti] = z;
+                    color[ti] = tri.shaded;
+                }
+            }
+        }
+    }
+}
