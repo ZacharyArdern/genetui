@@ -117,6 +117,9 @@ pub struct App {
     /// Set to true to request a full terminal clear on the next frame (clears external writes).
     pub needs_clear: bool,
     pub source_files: Vec<String>,
+    /// When true, the fold command is jwohlwend/minifold predict.py, which writes PDBs into
+    /// a nested minifold_results_<basename>/ subdirectory instead of flat in out_dir.
+    pub fold_predict_py: bool,
 }
 
 impl App {
@@ -181,6 +184,7 @@ impl App {
             anim_tick: 0,
             needs_clear: false,
             source_files: Vec::new(),
+            fold_predict_py: false,
         }
     }
 

@@ -27,7 +27,7 @@ struct Cli {
     #[arg(required = true)]
     files: Vec<String>,
 
-    /// Path to minifold_mlx directory
+    /// Path to MiniFold-MLX repo directory (uses fold.py inside); falls back to `minifold` in PATH
     #[arg(long)]
     minifold_mlx: Option<String>,
 
@@ -52,12 +52,16 @@ struct Cli {
     famsa: Option<String>,
 }
 
-fn which_minifold() -> bool {
-    std::process::Command::new("which")
-        .arg("minifold")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+
+/// Returns the full path to a script if it is found in PATH.
+fn which_script(name: &str) -> Option<String> {
+    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    if out.status.success() {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() { Some(path) } else { None }
+    } else {
+        None
+    }
 }
 
 fn find_famsa(explicit: Option<String>) -> Option<String> {
@@ -108,21 +112,19 @@ async fn main() -> Result<()> {
             .or_else(|| cli.out_dir.clone())
             .unwrap_or_else(|| ".".to_string())
     };
-    let on_click_cmd: Option<String> = if let Some(ref dir) = cli.minifold_mlx {
-        let dir = std::path::Path::new(dir);
-        let script = dir.join("predict_mlx.py");
-        let mlx_esm = dir.join("minifold_cache/checkpoints/mlx-esm2_t36_3B_UR50D_finetuned");
-        let mlx_minifold = dir.join("minifold_mlx_48L");
-        let out_dir = default_out_dir();
-        Some(format!(
-            "python {} {{protein_fasta}} --mlx_esm_path {} --mlx_minifold {} --out_dir {}",
-            script.display(), mlx_esm.display(), mlx_minifold.display(), out_dir
-        ))
-    } else if which_minifold() {
-        Some(format!("minifold {{protein_fasta}} --out_dir {}", default_out_dir()))
-    } else {
-        None
-    };
+    // Priority: --minifold_mlx <dir> (fold.py) → minifold in PATH → predict.py in PATH → disabled
+    let out_dir_arg = default_out_dir();
+    let (on_click_cmd, use_predict_py): (Option<String>, bool) =
+        if let Some(ref dir) = cli.minifold_mlx {
+            let fold_py = std::path::Path::new(dir).join("fold.py");
+            (Some(format!("python {} {{protein_fasta}} --out_dir {}", fold_py.display(), out_dir_arg)), false)
+        } else if which_script("minifold").is_some() {
+            (Some(format!("minifold {{protein_fasta}} --out_dir {}", out_dir_arg)), false)
+        } else if let Some(py) = which_script("predict.py") {
+            (Some(format!("python {} {{protein_fasta}} --out_dir {}", py, out_dir_arg)), true)
+        } else {
+            (None, false)
+        };
 
     let (genome_seq, genome_name, seqname_offsets, plasmid_entries) =
         if let Some(ref path) = fasta_path {
@@ -199,6 +201,7 @@ async fn main() -> Result<()> {
     let famsa_bin = find_famsa(cli.famsa.clone());
 
     let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);
+    app.fold_predict_py = use_predict_py && app.on_click_cmd.is_some();
     app.source_files = std::iter::once(Some(gff_path.clone()))
         .chain([fasta_path.clone(), bam_path.clone()])
         .filter_map(|p| p)
@@ -653,10 +656,15 @@ async fn start_fold(
     if let (Some(ref cmd_tmpl), Some(ref out_dir)) =
         (app.on_click_cmd.clone(), app.fold_out_dir.clone())
     {
-        let expected_pdb = format!("{}/{}.pdb", out_dir, safe_id);
-
         let pid       = std::process::id();
         let tmp_fasta = format!("/tmp/{}_{}.fa", safe_id, pid);
+        let fasta_base = format!("{}_{}", safe_id, pid);
+        let expected_pdb = if app.fold_predict_py {
+            // jwohlwend/minifold: output goes into a nested results subdirectory
+            format!("{}/minifold_results_{}/{}.pdb", out_dir, fasta_base, safe_id)
+        } else {
+            format!("{}/{}.pdb", out_dir, safe_id)
+        };
         let fasta_content = format!(">{}\n{}\n", safe_id, aa);
         let out_dir2 = out_dir.clone();
         if let Err(e) = std::fs::create_dir_all(out_dir).and_then(|_| std::fs::write(&tmp_fasta, &fasta_content)) {
