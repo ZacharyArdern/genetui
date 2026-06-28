@@ -461,9 +461,27 @@ pub fn compute_alignment_coverage(
     let n_threads = std::thread::available_parallelism()
         .map(|p| p.get()).unwrap_or(1).saturating_sub(1);
 
+    // Prevent htslib from going to the network (EBI) to fetch CRAM references.
+    // We only need alignment positions, not sequence data, so no reference is needed.
+    // Setting REF_PATH to "." restricts htslib to local files only.
+    unsafe { std::env::set_var("REF_PATH", "."); }
+
     let mut reader = Reader::from_path(path)?;
     if let Some(r) = ref_path {
-        reader.set_reference(r)?;
+        // Only pass the reference if it has a usable .fai index alongside it.
+        // Plain gzip files (.gz without .fai) cannot be used by htslib as CRAM references.
+        let fai = format!("{}.fai", r);
+        if std::path::Path::new(&fai).exists() {
+            let _ = reader.set_reference(r);
+        } else if r.ends_with(".gz") {
+            eprintln!(
+                "Note: skipping gzip-compressed FASTA as CRAM reference (no .fai index). \
+                 To enable: gunzip '{}' && samtools faidx '{}'",
+                r, r.trim_end_matches(".gz")
+            );
+        } else {
+            let _ = reader.set_reference(r);
+        }
     }
     if n_threads > 0 {
         reader.set_threads(n_threads)?;
@@ -482,8 +500,22 @@ pub fn compute_alignment_coverage(
         })
         .collect();
 
+    if !seqname_offsets.is_empty() && ref_offsets.iter().all(|o| o.is_none()) {
+        let bam_refs: Vec<_> = (0..n_refs)
+            .filter_map(|i| std::str::from_utf8(hview.tid2name(i as u32)).ok().map(|s| s.to_string()))
+            .collect();
+        eprintln!(
+            "Warning: BAM reference names ({}) don't match FASTA sequence names — coverage will be empty.",
+            bam_refs.join(", ")
+        );
+    }
+
+    let mut decode_errors = 0u32;
     for result in reader.records() {
-        let record = result?;
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => { decode_errors += 1; continue; }
+        };
         if record.is_unmapped() || record.is_secondary() || record.is_supplementary() {
             continue;
         }
@@ -502,6 +534,19 @@ pub fn compute_alignment_coverage(
         } else {
             plus[bin] = plus[bin].saturating_add(1);
         }
+    }
+
+    let total_reads = plus.iter().map(|&v| v as u64).sum::<u64>()
+        + minus.iter().map(|&v| v as u64).sum::<u64>();
+    if decode_errors > 0 {
+        eprintln!(
+            "Warning: {decode_errors} CRAM record(s) failed to decode (reference mismatch?). \
+             {} reads counted.",
+            total_reads
+        );
+    }
+    if total_reads == 0 && decode_errors == 0 {
+        eprintln!("Warning: coverage is all-zero — BAM/CRAM may be empty or reference names may not match.");
     }
 
     Ok(StrandCoverage { plus, minus, bin_size: BIN, genome_size })

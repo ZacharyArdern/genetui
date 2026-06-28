@@ -51,6 +51,27 @@ cargo build --release
 
 Requires Rust 1.70+. The `rust-htslib` dependency needs `htslib` headers (`brew install htslib` on macOS).
 
+## Citation
+
+If you use genetui in your research, please cite:
+
+> Ardern, Z. (2026). *genetui: a terminal-based genome browser with live browser extension* [Computer software]. GitHub. https://github.com/ZacharyArdern/genetui
+
+BibTeX:
+
+```bibtex
+@software{ardern2026genetui,
+  author  = {Ardern, Zachary},
+  title   = {genetui: a terminal-based genome browser with live browser extension},
+  year    = {2026},
+  url     = {https://github.com/ZacharyArdern/genetui}
+}
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Key dependencies & acknowledgements
 
 | Component | Library / Tool | Notes |

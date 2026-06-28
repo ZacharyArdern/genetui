@@ -54,16 +54,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     const COV_H: u16 = 4;
-    let cov_shown   = app.coverage.is_some() && app.display_opts.show_coverage;
+    // Coverage is chromosome-only; don't show it when a plasmid is active.
+    let cov_shown   = app.coverage.is_some() && app.display_opts.show_coverage && app.active_genome == 0;
     let cov_extra   = if cov_shown { COV_H * 2 } else { 0 };
     let fixed_rows  = TRACK_PHYS as u16 + 1 + 2 + 1 + cov_extra;
     let minimap_h   = MINIMAP_H.min(size.height.saturating_sub(fixed_rows));
     let track_min   = TRACK_PHYS as u16 + 1 + cov_extra;
 
+    let msa_open = app.msa.is_some();
+    let (track_constraint, msa_constraint) = if msa_open {
+        (Constraint::Length(track_min), Constraint::Min(10))
+    } else {
+        (Constraint::Min(track_min), Constraint::Length(0))
+    };
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(track_min),
+            track_constraint,
+            msa_constraint,
             Constraint::Length(minimap_h),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -72,9 +81,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let track_area  = vertical[0];
     app.gene_track_rect = track_area;
-    let bottom_area = vertical[1];
-    let info_area   = vertical[2];
-    let status_area = vertical[3];
+    let msa_area    = vertical[1];
+    let bottom_area = vertical[2];
+    let info_area   = vertical[3];
+    let status_area = vertical[4];
 
     // Protein panel splits the bottom row horizontally when open.
     const LEGEND_W: u16 = 16;
@@ -163,6 +173,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     if let Some(pa) = protein_area_opt { draw_protein_panel(f, app, pa); }
+    if msa_open                           { draw_msa_panel(f, app, msa_area); }
     if app.display_opts.show_chr_map      { draw_minimap(f, app, minimap_area); }
     if app.display_opts.show_legend       { draw_legend(f, app, legend_area); }
     if app.display_opts.show_plasmid_maps { draw_plasmid_maps(f, app, plasmid_area); }
@@ -193,6 +204,9 @@ fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     if width == 0 || height == 0 {
         return;
     }
+
+    // Clear area first so stale cells from previous frames don't ghost through.
+    f.render_widget(Clear, area);
 
     const LABEL_W: usize = 4;
     let feat_w = if width > LABEL_W { width - LABEL_W } else { 1 };
@@ -293,6 +307,9 @@ fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let top_pad = if height > TRACK_PHYS { (height - TRACK_PHYS) / 2 } else { 0 };
+
+    let hovered_feat  = app.hovered;
+    let selected_feat = app.selected;
 
     let mut new_hit_map: crate::app::HitMap = Vec::new();
     let mut lines: Vec<Line> = Vec::new();
@@ -395,8 +412,18 @@ fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 MINUS_COLORS[vf.color_idx % MINUS_COLORS.len()]
             };
-            let gene_col = Color::Rgb(r, g, b);
-
+            let is_selected = selected_feat == Some(vf.idx);
+            let is_hovered  = hovered_feat  == Some(vf.idx);
+            let gene_col = if is_selected {
+                // White fill with dark text for selected gene
+                Color::White
+            } else if is_hovered {
+                // Brighten toward white
+                let bri = |x: u8| -> u8 { 255u8.min(x.saturating_add(70)) };
+                Color::Rgb(bri(r), bri(g), bri(b))
+            } else {
+                Color::Rgb(r, g, b)
+            };
             let tip = if vf.strand == '+' { '▶' } else { '◀' };
             for j in 0..fw {
                 if cs + j < feat_w {
@@ -1124,6 +1151,7 @@ fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: char) {
     let width  = area.width  as usize;
     let height = area.height as usize;
     if width == 0 || height == 0 { return; }
+    f.render_widget(Clear, area);
 
     const LABEL_W: usize = 4;
     let feat_w = if width > LABEL_W { width - LABEL_W } else { 1 };
@@ -1504,6 +1532,9 @@ fn draw_display_menu(f: &mut Frame, app: &mut App) {
         if app.protein.is_some() {
             v.push(MenuItem { label: "Structure panel", checked: true });
         }
+        if app.msa.is_some() {
+            v.push(MenuItem { label: "MSA panel",       checked: true });
+        }
         v
     };
 
@@ -1551,6 +1582,8 @@ fn draw_display_menu(f: &mut Frame, app: &mut App) {
 fn draw_protein_panel(f: &mut Frame, app: &App, area: Rect) {
     let panel = match &app.protein { Some(p) => p, None => return };
 
+    f.render_widget(Clear, area);
+
     let border_color = if app.active_panel == crate::app::ActivePanel::Protein {
         Color::White
     } else if panel.folding {
@@ -1575,13 +1608,21 @@ fn draw_protein_panel(f: &mut Frame, app: &App, area: Rect) {
     if inner.width < 4 || inner.height < 2 { return; }
 
     if panel.folding {
-        let y = inner.y + inner.height / 2;
+        const SPIN: &[char] = &['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+        let spin = SPIN[(app.anim_tick as usize / 2) % SPIN.len()];
+        let aa_len = panel.aa_seq.len();
+        let line1 = Line::from(Span::styled(
+            format!("  {}  Folding {}…", spin, panel.gene_name),
+            Style::default().fg(Color::Rgb(100, 160, 230)).bg(Color::Black),
+        ));
+        let line2 = Line::from(Span::styled(
+            format!("     {} amino acids", aa_len),
+            Style::default().fg(Color::Rgb(60, 80, 130)).bg(Color::Black),
+        ));
+        let y_off = inner.height.saturating_sub(2) / 2;
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  ⟳  Folding…  (minifold)",
-                Style::default().fg(Color::Rgb(100, 160, 230)).bg(Color::Black),
-            ))),
-            Rect { y, height: 1, ..inner },
+            Paragraph::new(vec![line1, line2]).style(Style::default().bg(Color::Black)),
+            Rect { y: inner.y + y_off, height: inner.height.saturating_sub(y_off), ..inner },
         );
         return;
     }
@@ -1691,4 +1732,129 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let status = Paragraph::new(msg)
         .style(Style::default().fg(fg).bg(Color::Rgb(49, 50, 68)));
     f.render_widget(status, area);
+}
+
+// ── MSA panel ────────────────────────────────────────────────────────────────
+
+fn aa_color(c: char) -> Color {
+    match c.to_ascii_uppercase() {
+        'K' | 'R'                         => Color::Red,
+        'A' | 'F' | 'I' | 'L' | 'M' | 'V' | 'W' => Color::Blue,
+        'N' | 'Q' | 'S' | 'T'            => Color::Green,
+        'H' | 'Y'                         => Color::Cyan,
+        'C'                               => Color::LightRed,
+        'D' | 'E'                         => Color::Magenta,
+        'P'                               => Color::Yellow,
+        'G'                               => Color::Rgb(255, 200, 150),
+        '-' | '.'                         => Color::DarkGray,
+        _                                 => Color::White,
+    }
+}
+
+pub fn draw_msa_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    app.msa_panel_rect = area;
+    f.render_widget(Clear, area);
+    let panel = match &app.msa { Some(p) => p, None => return };
+    let is_active = app.active_panel == crate::app::ActivePanel::Msa;
+
+    let border_style = if is_active {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::Rgb(50, 60, 80))
+    };
+    let block = Block::default()
+        .title(format!(" MSA: {}  (Esc close  ←→↑↓ scroll  Tab switch) ", panel.gene_name))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if panel.loading {
+        const SPIN: &[char] = &['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+        let spin = SPIN[(app.anim_tick as usize / 2) % SPIN.len()];
+        let line1 = Line::from(Span::styled(
+            format!("  {}  Searching homologs of {}…", spin, panel.gene_name),
+            Style::default().fg(Color::Rgb(80, 200, 180)).bg(Color::Black),
+        ));
+        let line2 = Line::from(Span::styled(
+            "     DIAMOND → FAMSA alignment in progress",
+            Style::default().fg(Color::Rgb(40, 100, 90)).bg(Color::Black),
+        ));
+        let y_off = inner.height.saturating_sub(2) / 2;
+        f.render_widget(
+            Paragraph::new(vec![line1, line2]).style(Style::default().bg(Color::Black)),
+            Rect { y: inner.y + y_off, height: inner.height.saturating_sub(y_off), ..inner },
+        );
+        return;
+    }
+    if let Some(ref err) = panel.error {
+        let lines = vec![
+            Line::from(Span::styled("  Error:", Style::default().fg(Color::Red).bg(Color::Black))),
+            Line::from(Span::styled(format!("  {}", err), Style::default().fg(Color::LightRed).bg(Color::Black))),
+        ];
+        f.render_widget(Paragraph::new(lines).style(Style::default().bg(Color::Black)), inner);
+        return;
+    }
+    if panel.sequences.is_empty() {
+        f.render_widget(
+            Paragraph::new("  No homologs found").style(Style::default().fg(Color::DarkGray).bg(Color::Black)),
+            inner,
+        );
+        return;
+    }
+
+    const NAME_W: u16 = 20;
+    if inner.width <= NAME_W + 2 || inner.height < 2 { return; }
+    let seq_rows  = inner.height.saturating_sub(1) as usize;
+    let status_y  = inner.y + inner.height.saturating_sub(1);
+    let name_area = Rect { x: inner.x, y: inner.y, width: NAME_W, height: inner.height.saturating_sub(1) };
+    let seq_area  = Rect { x: inner.x + NAME_W, y: inner.y,
+                           width: inner.width.saturating_sub(NAME_W), height: inner.height.saturating_sub(1) };
+
+    // Names column
+    let name_lines: Vec<Line> = panel.sequences.iter()
+        .skip(panel.viewport_row)
+        .take(seq_rows)
+        .map(|(id, _)| {
+            let s = if id.len() >= NAME_W as usize { &id[..NAME_W as usize - 1] } else { id.as_str() };
+            Line::from(Span::styled(
+                format!("{:<width$}", s, width = NAME_W as usize),
+                Style::default().fg(Color::Rgb(100, 160, 230)).bg(Color::Black),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(name_lines).style(Style::default().bg(Color::Black)), name_area);
+
+    // Sequence columns — Seaview-style AA colours
+    let vis_cols = seq_area.width as usize;
+    let seq_lines: Vec<Line> = panel.sequences.iter()
+        .skip(panel.viewport_row)
+        .take(seq_rows)
+        .map(|(_, seq)| {
+            let spans: Vec<Span> = seq.chars()
+                .skip(panel.viewport_col)
+                .take(vis_cols)
+                .map(|c| Span::styled(
+                    c.to_string(),
+                    Style::default().fg(aa_color(c)).bg(Color::Black),
+                ))
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(seq_lines).style(Style::default().bg(Color::Black)), seq_area);
+
+    // Status line
+    let aln_len = panel.sequences.first().map(|(_, s)| s.len()).unwrap_or(0);
+    let status = format!(
+        "  col {}/{} | seq {}/{} | {} total",
+        panel.viewport_col.saturating_add(1), aln_len,
+        panel.viewport_row.saturating_add(1), panel.sequences.len(),
+        panel.sequences.len(),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(status, Style::default().fg(Color::Rgb(80,90,110)).bg(Color::Black)))),
+        Rect { x: inner.x, y: status_y, width: inner.width, height: 1 },
+    );
 }

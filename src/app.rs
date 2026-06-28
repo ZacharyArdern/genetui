@@ -3,7 +3,16 @@ use ratatui::layout::Rect;
 use crate::core::Feature;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum ActivePanel { Genome, Protein }
+pub enum ActivePanel { Genome, Protein, Msa }
+
+pub struct MsaPanel {
+    pub gene_name:    String,
+    pub sequences:    Vec<(String, String)>,  // (id, aligned_sequence)
+    pub loading:      bool,
+    pub error:        Option<String>,
+    pub viewport_row: usize,
+    pub viewport_col: usize,
+}
 
 pub struct ProteinPanel {
     pub gene_name: String,
@@ -64,6 +73,7 @@ pub struct App {
     pub selected: Option<usize>,
     pub hovered: Option<usize>,
     pub status_msg: String,
+    pub status_msg_ticks: u32,  // countdown; 0 = message expired
     pub on_click_cmd: Option<String>,
     /// (row_idx, col_start, col_end, feature_idx)
     pub hit_map: HitMap,
@@ -97,6 +107,16 @@ pub struct App {
     pub gene_track_rect: Rect,
     /// out_dir from --minifold_mlx, used to locate output PDB after folding.
     pub fold_out_dir: Option<String>,
+    // MSA panel
+    pub msa: Option<MsaPanel>,
+    pub msa_panel_rect: Rect,
+    pub dmnd_db: Option<String>,
+    pub famsa_bin: Option<String>,
+    /// Incremented each tick; used by the UI for spinner animation.
+    pub anim_tick: u64,
+    /// Set to true to request a full terminal clear on the next frame (clears external writes).
+    pub needs_clear: bool,
+    pub source_files: Vec<String>,
 }
 
 impl App {
@@ -111,6 +131,8 @@ impl App {
         plasmids: Vec<PlasmidData>,
         coverage: Option<crate::core::StrandCoverage>,
         fold_out_dir: Option<String>,
+        dmnd_db: Option<String>,
+        famsa_bin: Option<String>,
     ) -> Self {
         let view_end = genome_size.min(20_000).max(1);
         App {
@@ -124,6 +146,7 @@ impl App {
             selected: None,
             hovered: None,
             status_msg: String::new(),
+            status_msg_ticks: 0,
             on_click_cmd,
             hit_map: Vec::new(),
             gc_skew,
@@ -151,6 +174,13 @@ impl App {
             active_panel: ActivePanel::Genome,
             gene_track_rect: Rect::default(),
             fold_out_dir,
+            msa: None,
+            msa_panel_rect: Rect::default(),
+            dmnd_db,
+            famsa_bin,
+            anim_tick: 0,
+            needs_clear: false,
+            source_files: Vec::new(),
         }
     }
 
@@ -167,6 +197,23 @@ impl App {
             img_cache: None,
             pdb_raw: String::new(),
         });
+    }
+
+    /// Set a transient status message that auto-expires after ~5 s (100 ticks at ~50 ms each).
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = msg.into().replace('\n', " ").replace('\r', "");
+        self.status_msg_ticks = 100;
+    }
+
+    /// Call once per tick; clears the message when its TTL expires.
+    pub fn tick_status(&mut self) {
+        self.anim_tick = self.anim_tick.wrapping_add(1);
+        if self.status_msg_ticks > 0 {
+            self.status_msg_ticks -= 1;
+            if self.status_msg_ticks == 0 {
+                self.status_msg.clear();
+            }
+        }
     }
 
     /// Toggle the display option currently highlighted in the menu.
@@ -196,6 +243,15 @@ impl App {
                 self.active_panel = ActivePanel::Genome;
                 return;
             }
+            idx += 1;
+        }
+        // "MSA panel" item: closing it clears the msa.
+        if self.msa.is_some() {
+            if idx == self.display_menu_idx {
+                self.msa = None;
+                self.active_panel = ActivePanel::Genome;
+                return;
+            }
         }
     }
 
@@ -204,6 +260,7 @@ impl App {
         if !self.plasmids.is_empty() { n += 1; }
         if self.coverage.is_some()   { n += 1; }
         if self.protein.is_some()    { n += 1; }
+        if self.msa.is_some()        { n += 1; }
         n
     }
 

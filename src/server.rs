@@ -19,10 +19,15 @@ pub struct BrowserState {
     pub genome_size: u64,
     pub genome_name: String,
     pub features: Vec<BrowserFeature>,
-    pub sequence: String,   // DNA bases for seq_start..(seq_start+sequence.len()) (may be empty)
-    pub seq_start: u64,    // genomic offset of sequence[0]
-    pub protein_pdb: String,   // raw PDB text of selected+folded protein (may be empty)
-    pub protein_name: String,  // gene name for the PDB
+    pub sequence: String,        // DNA bases for seq_start..(seq_start+sequence.len()) (may be empty)
+    pub seq_start: u64,         // genomic offset of sequence[0]
+    pub protein_pdb: String,    // raw PDB text of selected+folded protein (may be empty)
+    pub protein_name: String,   // gene name for the PDB
+    pub coverage_plus:      Vec<u32>,   // per-bin read depth, plus strand
+    pub coverage_minus:     Vec<u32>,   // per-bin read depth, minus strand
+    pub coverage_bin_size:  u64,        // bp per bin
+    pub coverage_bin_start: u64,        // genomic position of first bin
+    pub input_files: Vec<String>,       // source file paths (gff, fasta, bam)
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -319,6 +324,7 @@ body {
         <button class="dbtn" id="btn-render" disabled>Render</button>
         <button class="dbtn" id="btn-svg"   disabled>SVG</button>
         <button class="dbtn" id="btn-png"   disabled>PNG 600dpi</button>
+        <button class="dbtn" id="btn-py"    disabled>Download code</button>
       </div>
     </div>
     <div id="fig-output">
@@ -373,6 +379,18 @@ body {
     <div class="cr">
       <input type="checkbox" id="opt-stopcodons" checked>
       <label for="opt-stopcodons">Stop codons (live + figure)</label>
+    </div>
+  </div>
+  <hr class="osep">
+  <div class="og">
+    <div class="cr">
+      <label for="cov-style-fig">Coverage (figure)</label>
+      <select id="cov-style-fig">
+        <option value="none">None</option>
+        <option value="histogram">Histogram</option>
+        <option value="kernel">Kernel (smoothed)</option>
+        <option value="reads">Raw reads</option>
+      </select>
     </div>
   </div>
 </div>
@@ -452,6 +470,10 @@ function drawSVG(state, vs, ve) {
   const {genome_size, genome_name, features, sequence='', seq_start: seqOff=0} = state;
   const span  = Math.max(ve-vs,1), scale = W/span;
   const sixFrame = document.getElementById('opt-sixframe').checked;
+  const covStyle = document.getElementById('cov-style-svg').value;
+  const hasCovData = state.coverage_plus && state.coverage_plus.length > 0;
+  const covH = (covStyle !== 'none' && hasCovData)
+    ? parseInt(document.getElementById('cov-height').value) : 0;
 
   document.getElementById('genome-name').textContent = genome_name || 'genome';
   document.getElementById('position').textContent =
@@ -468,11 +490,22 @@ function drawSVG(state, vs, ve) {
     out.push(`<text x="${(x+3)|0}" y="${RULER_H-10}" font-size="10" fill="#8b949e" font-family="monospace">${fmt(pos)}</text>`);
   }
 
-  if (sixFrame) {
-    drawSixFrame(features, sequence, seqOff, vs, ve, W, H, scale, out);
-  } else {
-    drawSimple(features, vs, ve, W, H, scale, out);
+  // cov+ above gene tracks (below ruler), cov- below gene tracks — mirrors TUI layout
+  const yGeneTop = RULER_H + covH;
+  if (covH > 0) drawCoverageStrand(state, vs, ve, W, RULER_H, covH, true, out);
+  else if (covStyle !== 'none' && !hasCovData) {
+    out.push(`<rect x="0" y="${RULER_H}" width="${W}" height="20" fill="#0a0e18"/>`);
+    out.push(`<text x="${W/2|0}" y="${RULER_H+13}" text-anchor="middle" font-size="10" fill="#3d4a5e" font-family="monospace">coverage: no BAM loaded (--bam reads.bam)</text>`);
   }
+
+  let geneBottom;
+  if (sixFrame) {
+    geneBottom = drawSixFrame(features, sequence, seqOff, vs, ve, W, scale, out, yGeneTop);
+  } else {
+    geneBottom = drawSimple(features, vs, ve, W, scale, out, yGeneTop);
+  }
+
+  if (covH > 0) drawCoverageStrand(state, vs, ve, W, geneBottom, covH, false, out);
 
   // Minimap
   if (genome_size > 0) {
@@ -486,12 +519,14 @@ function drawSVG(state, vs, ve) {
 }
 
 // ── Simple +/- track ──────────────────────────────────────────────────────────
-function drawSimple(features, vs, ve, W, H, scale, out) {
+// Returns the Y coordinate of the bottom of the minus gene track.
+function drawSimple(features, vs, ve, W, scale, out, yTop) {
   const SGAP = 8;
   const plus  = assignLevels(features.filter(f=>f.strand==='+'), scale, vs);
   const minus = assignLevels(features.filter(f=>f.strand==='-'), scale, vs);
-  const nPlus = plus.length  ? Math.max(0,...plus.map(f=>f.lv))+1 : 0;
-  const divY  = RULER_H + nPlus*LEVEL_GAP + SGAP;
+  const nPlus  = plus.length  ? Math.max(0,...plus.map(f=>f.lv))+1 : 0;
+  const nMinus = minus.length ? Math.max(0,...minus.map(f=>f.lv))+1 : 0;
+  const divY   = yTop + nPlus*LEVEL_GAP + SGAP;
   out.push(`<line x1="0" y1="${divY}" x2="${W}" y2="${divY}" stroke="#21262d" stroke-width="1"/>`);
   const drawG = (f, cy, strand) => {
     const col = f.noncoding ? NC_COLOR : f.color;
@@ -508,39 +543,40 @@ function drawSimple(features, vs, ve, W, H, scale, out) {
   };
   plus.forEach(f  => drawG(f, divY-SGAP-ARROW_H/2-f.lv*LEVEL_GAP, '+'));
   minus.forEach(f => drawG(f, divY+SGAP+ARROW_H/2+f.lv*LEVEL_GAP, '-'));
+  return nMinus > 0
+    ? (divY + SGAP + ARROW_H + (nMinus-1)*LEVEL_GAP + 14)|0
+    : divY + SGAP*2;
 }
 
 // ── Six-frame translation track ───────────────────────────────────────────────
-function drawSixFrame(features, seq, seqOff, vs, ve, W, H, scale, out) {
+// Returns the Y coordinate of the bottom of the non-coding minus track.
+function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop) {
   const rc      = rcSeq(seq);
   const seqLen  = seq.length;
   const showSC  = document.getElementById('opt-stopcodons').checked;
-  // Bin stop codons by ABSOLUTE GENOMIC frame (0/1/2) so they align with gene frames.
-  // Gene frame (1-based coords): (f.start-1)%3 (+) or (f.end-1)%3 (-).
-  // seqOff is 0-based, so (seqOff+p)%3 == (1-based-1)%3 — already consistent.
   const fwdStops = [[],[],[]];
   const revStops = [[],[],[]];
   if (showSC && seq) {
     for (let rcFr = 0; rcFr < 3; rcFr++) {
       for (const p of stopPositions(seq, rcFr)) {
-        const gp = seqOff + p;          // genomic start of codon
+        const gp = seqOff + p;
         fwdStops[gp % 3].push(gp);
       }
       for (const p of stopPositions(rc, rcFr)) {
-        const gEnd = seqOff + seqLen - p - 1;   // genomic end (3′) of minus codon
-        revStops[gEnd % 3].push(seqOff + seqLen - p - 2);  // display at codon midpoint
+        const gEnd = seqOff + seqLen - p - 1;
+        revStops[gEnd % 3].push(seqOff + seqLen - p - 2);
       }
     }
   }
 
-  const divY = RULER_H + FH*3;
-  const ncYp = divY + FH*3 + 3;   // non-coding + row
-  const ncYm = ncYp + FH + 2;     // non-coding - row
+  const divY = yTop + FH*3;
+  const ncYp = divY + FH*3 + 3;
+  const ncYm = ncYp + FH + 2;
 
   // Frame row backgrounds
   for (let fr=0;fr<3;fr++) {
     const bg = fr%2 ? '#0f1520' : '#0d1117';
-    out.push(`<rect x="0" y="${RULER_H+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
+    out.push(`<rect x="0" y="${yTop+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
     out.push(`<rect x="0" y="${divY+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
   }
 
@@ -549,13 +585,13 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, H, scale, out) {
 
   // Stop codon ticks — forward
   for (let fr=0;fr<3;fr++) {
-    const y1=RULER_H+FH*fr+2, y2=RULER_H+FH*(fr+1)-2;
+    const y1=yTop+FH*fr+2, y2=yTop+FH*(fr+1)-2;
     for (const gp of fwdStops[fr]) {
       const x=(gp-vs)*scale;
       if (x<-1||x>W+1) continue;
       out.push(`<line x1="${x|0}" y1="${y1}" x2="${x|0}" y2="${y2}" stroke="${STOP_COL}" stroke-width="1" opacity="0.6"/>`);
     }
-    out.push(`<text x="3" y="${(RULER_H+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">+${fr+1}</text>`);
+    out.push(`<text x="3" y="${(yTop+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">+${fr+1}</text>`);
   }
   // Stop codon ticks — reverse
   for (let fr=0;fr<3;fr++) {
@@ -577,7 +613,7 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, H, scale, out) {
     if (x2c<=x1c) continue;
     const col = f.color;
     const fr  = f.strand==='+' ? (f.start-1)%3 : (f.end-1)%3;
-    const cy  = f.strand==='+' ? RULER_H+FH*fr+FH/2 : divY+FH*fr+FH/2;
+    const cy  = f.strand==='+' ? yTop+FH*fr+FH/2 : divY+FH*fr+FH/2;
     const pts = arrowPts(x1c, x2c, cy, gh, f.strand);
     const lw  = x2c-x1c;
     out.push(`<g class="gene"><title>${esc(f.name)}</title><polygon points="${pts}" fill="${col}" fill-opacity="0.9"/>`);
@@ -600,6 +636,97 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, H, scale, out) {
     const cy = f.strand==='+' ? ncYp+FH/2 : ncYm+FH/2;
     const pts = arrowPts(x1c, x2c, cy, FH-6, f.strand);
     out.push(`<g class="gene"><title>${esc(f.name)}</title><polygon points="${pts}" fill="${NC_COLOR}" fill-opacity="0.7"/></g>`);
+  }
+  return ncYm + FH + 4;
+}
+
+// ── Coverage track ────────────────────────────────────────────────────────────
+function gaussSmooth1D(arr, sigma) {
+  const r=Math.ceil(3*sigma); const kern=[]; let sum=0;
+  for (let i=-r;i<=r;i++) { const w=Math.exp(-0.5*(i/sigma)**2); kern.push(w); sum+=w; }
+  kern.forEach((_,i,a)=>a[i]/=sum);
+  return arr.map((_,ci)=>{
+    let s=0;
+    for (let j=0;j<kern.length;j++) { const idx=ci+j-r; if (idx>=0&&idx<arr.length) s+=arr[idx]*kern[j]; }
+    return s;
+  });
+}
+
+// Draw one strand's coverage track. isPlus=true → bars grow up (track above gene track);
+// isPlus=false → bars grow down (track below gene track).
+function drawCoverageStrand(state, vs, ve, W, yBase, trackH, isPlus, out) {
+  const style = document.getElementById('cov-style-svg').value;
+  if (style === 'none') return;
+  const binSz  = state.coverage_bin_size  || 1000;
+  const binOff = state.coverage_bin_start || 0;
+  const data   = isPlus ? (state.coverage_plus||[]) : (state.coverage_minus||[]);
+  if (!data.length) return;
+  const span = Math.max(ve-vs,1), scaleX = W/span;
+  const col  = isPlus ? '#58a6ff' : '#f78166';
+
+  out.push(`<rect x="0" y="${yBase}" width="${W}" height="${trackH}" fill="#080d1a" opacity="0.9"/>`);
+
+  const firstBin = Math.max(0, Math.floor((vs-binOff)/binSz));
+  const lastBin  = Math.min(data.length-1, Math.ceil((ve-binOff)/binSz));
+  if (firstBin > lastBin) return;
+  const vd = data.slice(firstBin, lastBin+1);
+  const maxCov = Math.max(1, ...vd), logMax = Math.log10(maxCov+1);
+
+  const toH  = val => val<=0 ? 0 : Math.log10(val+1)/logMax * (trackH-4);
+  const bx1  = i => (binOff+(firstBin+i)*binSz-vs)*scaleX;
+  const bx2  = i => (binOff+(firstBin+i)*binSz+binSz-vs)*scaleX;
+  const bcx  = i => (bx1(i)+bx2(i))/2;
+
+  if (style === 'histogram') {
+    for (let i=0; i<vd.length; i++) {
+      if (!vd[i]) continue;
+      const x1=Math.max(0,bx1(i)), x2=Math.min(W,bx2(i)); if (x2<=x1) continue;
+      const bw=Math.max(1,x2-x1)|0, px=x1|0, h=toH(vd[i])|0;
+      const y = isPlus ? yBase+trackH-2-h : yBase+2;
+      out.push(`<rect x="${px}" y="${y}" width="${bw}" height="${h}" fill="${col}" opacity="0.75"/>`);
+    }
+  } else if (style === 'kernel') {
+    const sm = gaussSmooth1D(vd, 0.8);
+    const pts = isPlus
+      ? sm.map((_,i)=>`${bcx(i)|0},${(yBase+trackH-2-toH(sm[i]))|0}`).join(' ')
+      : sm.map((_,i)=>`${bcx(i)|0},${(yBase+2+toH(sm[i]))|0}`).join(' ');
+    const base = isPlus ? yBase+trackH-2 : yBase+2;
+    if (pts) {
+      out.push(`<polygon points="${pts} ${W},${base} 0,${base}" fill="${col}" opacity="0.2"/>`);
+      out.push(`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" opacity="0.9"/>`);
+    }
+  } else { // reads
+    const rh=2, rg=1, maxR=Math.floor((trackH-6)/(rh+rg));
+    function lcg(s) { return (Math.imul(s,1664525)+1013904223)|0; }
+    for (let i=0; i<vd.length; i++) {
+      const x1=Math.max(0,bx1(i))|0, x2=Math.min(W,bx2(i))|0; if (x2<=x1) continue;
+      const bw=x2-x1;
+      let seed=(firstBin+i)*(isPlus?12345:67890);
+      for (let r=0; r<Math.min(maxR,vd[i]); r++) {
+        seed=lcg(seed);
+        const rw=Math.max(3,(bw*0.55+((seed&0xff)/256-0.5)*bw*0.3))|0;
+        const rx=x1+Math.max(0,(((seed>>8)&0xff)/256)*(bw-rw))|0;
+        if (isPlus) {
+          const ry=yBase+trackH-4-r*(rh+rg); if (ry<yBase+2) break;
+          out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
+        } else {
+          const ry=yBase+3+r*(rh+rg); if (ry+rh>yBase+trackH-2) break;
+          out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
+        }
+      }
+    }
+  }
+
+  // Label + log-scale y-axis ticks
+  out.push(`<text x="3" y="${isPlus?yBase+trackH-3:yBase+9}" font-size="7" fill="#484f58" font-family="monospace">${isPlus?'cov+':'cov-'}</text>`);
+  for (const lv of [1,10,100,1000,10000]) {
+    if (lv > maxCov*1.5) break;
+    const h = toH(lv);
+    const y = isPlus ? yBase+trackH-2-h : yBase+2+h;
+    if (isPlus && y < yBase+4) break;
+    if (!isPlus && y > yBase+trackH-4) break;
+    out.push(`<line x1="0" y1="${y|0}" x2="5" y2="${y|0}" stroke="#2d3547" stroke-width="1"/>`);
+    out.push(`<text x="7" y="${(y+3)|0}" font-size="7" fill="#3d4a5e" font-family="monospace">${lv<1000?lv:lv/1000+'k'}</text>`);
   }
 }
 
@@ -790,6 +917,9 @@ function optionChanged() { renderLocal(); scheduleAutoRender(); }
 document.getElementById('fig-hide-long-labels').addEventListener('change', function(){
   document.getElementById('overflow-thresh-row').style.display = this.checked ? '' : 'none';
 });
+document.getElementById('cov-style-fig').addEventListener('change', function(){
+  scheduleAutoRender();
+});
 
 // ── Panel selector (d key) ────────────────────────────────────────────────────
 (function(){
@@ -835,6 +965,41 @@ document.getElementById('fig-hide-long-labels').addEventListener('change', funct
     const lbl=document.createElement('label'); lbl.textContent=p.label;
     row.append(cb,lbl); box.appendChild(row);
   });
+  // Coverage style row (controls SVG live track only)
+  const covSep = document.createElement('div');
+  covSep.style.cssText='border-top:1px solid #21262d;margin:10px 0 8px;';
+  box.appendChild(covSep);
+  const covRow = document.createElement('div');
+  covRow.style.cssText='display:flex;align-items:center;gap:8px;font-size:12px;color:#c9d1d9;';
+  const covLbl = document.createElement('span'); covLbl.textContent='Coverage (live)';
+  covLbl.style.cssText='min-width:80px;color:#8b949e;';
+  const covSel = document.createElement('select');
+  covSel.id = 'cov-style-svg';
+  covSel.style.cssText='background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 4px;font-size:11px;';
+  [['none','None'],['histogram','Histogram'],['kernel','Kernel'],['reads','Raw reads']].forEach(([v,l])=>{
+    const o=document.createElement('option'); o.value=v; o.textContent=l; covSel.appendChild(o);
+  });
+  const covHRow = document.createElement('div');
+  covHRow.id='cov-height-row';
+  covHRow.style.cssText='display:none;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;margin-top:6px;';
+  const covHLbl = document.createElement('span'); covHLbl.textContent='Height';
+  covHLbl.style.cssText='min-width:80px;color:#8b949e;';
+  const covHIn = document.createElement('input');
+  covHIn.type='range'; covHIn.id='cov-height'; covHIn.min=30; covHIn.max=150; covHIn.step=5; covHIn.value=70;
+  covHIn.style.cssText='width:90px;';
+  const covHVal = document.createElement('span'); covHVal.id='lbl-cov-height'; covHVal.textContent='70';
+  covHVal.style.cssText='min-width:24px;font-size:11px;color:#8b949e;';
+  covHRow.append(covHLbl, covHIn, covHVal, Object.assign(document.createElement('span'),{textContent:'px',style:'font-size:10px;color:#8b949e;'}));
+  covSel.addEventListener('change', ()=>{
+    covHRow.style.display = covSel.value !== 'none' ? 'flex' : 'none';
+    renderLocal();
+  });
+  covHIn.addEventListener('input', ()=>{
+    covHVal.textContent = covHIn.value;
+    renderLocal();
+  });
+  covRow.append(covLbl, covSel); box.appendChild(covRow); box.appendChild(covHRow);
+
   ov.appendChild(box); document.body.appendChild(ov);
   window._panelCbs=panelCbs;  // expose so struct viewer can enable checkbox
   function toggleSel() {
@@ -909,6 +1074,24 @@ function buildPyCode(vs,ve,forPng) {
   const dpi       = forPng?600:96;
   const fmt_      = forPng?'png':'svg';
 
+  // Coverage data for subplot
+  const covStyle   = document.getElementById('cov-style-fig').value;
+  const covBinSz   = lastState.coverage_bin_size  || 1000;
+  const covBinOff  = lastState.coverage_bin_start || 0;
+  const covPlus    = lastState.coverage_plus  || [];
+  const covMinus   = lastState.coverage_minus || [];
+  let pyCovPlus = '[]', pyCovMinus = '[]', pyCovBinSz = covBinSz, pyCovBinOff = 0;
+  if (covStyle !== 'none' && covPlus.length) {
+    const fb = Math.max(0, Math.floor((vs - covBinOff) / covBinSz));
+    const lb = Math.min(covPlus.length - 1, Math.ceil((ve - covBinOff) / covBinSz));
+    if (fb <= lb) {
+      pyCovPlus   = JSON.stringify(covPlus.slice(fb, lb+1));
+      pyCovMinus  = JSON.stringify(covMinus.slice(fb, lb+1));
+      pyCovBinOff = covBinOff + fb * covBinSz;
+    }
+  }
+  const hasCov = covStyle !== 'none' && pyCovPlus !== '[]';
+
   // Approximate character width at current font size (inches per char, tuned to dna_features_viewer defaults)
   const charWidthIn = (fs / 11) * parseFloat(document.getElementById('fig-overflow-thresh').value);
   function labelFitsInFeature(f) {
@@ -967,15 +1150,27 @@ ${pyFeats}
                 _rev_stops[_gfr].append(_seq_sub_off+len(_seq_sub)-_i-2)
     # 6 rows: +1 +2 +3  -1 -2 -3  (strand_int, absolute_genomic_frame 0/1/2)
     _ROWS=[('+1',1,0),('+2',1,1),('+3',1,2),('-1',-1,0),('-2',-1,1),('-3',-1,2)]
-    # 7 gridspec rows: 3 fwd + thin separator + 3 rev
-    fig=plt.figure(figsize=(_width,6*0.38+0.6))
+    _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
+    _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
+    _has_cov=_cov_style!='none' and len(_cov_plus)>0
+    # Layout: [cov+,] +1,+2,+3, sep, -1,-2,-3 [,cov-]
+    _hr=([1.4] if _has_cov else [])+[0.75,0.75,0.75,0.25,0.75,0.75,0.75]+([1.4] if _has_cov else [])
+    _off=1 if _has_cov else 0   # gridspec offset for cov+ row
+    _fig_h=6*0.29+0.55+(1.6 if _has_cov else 0)
+    fig=plt.figure(figsize=(_width,_fig_h))
     fig.patch.set_facecolor(_bg)
-    gs=gridspec.GridSpec(7,1,figure=fig,hspace=0.0,
-        height_ratios=[1,1,1,0.25,1,1,1],
-        top=0.96,bottom=0.06,left=0.07,right=0.98)
+    gs=gridspec.GridSpec(len(_hr),1,figure=fig,hspace=0.0,
+        height_ratios=_hr,top=0.96,bottom=0.06,left=0.11,right=0.98)
+    import matplotlib.ticker as _tck
+    def _gfmt(x,p):
+        v=int(x)+${vs}
+        if v>=1000000: return f'{v//1000000}M'
+        if v>=1000: return f'{v//1000}k'
+        return str(v)
+    _bpfmt=_tck.FuncFormatter(_gfmt)
     _axes=[]
     for _ri,(_lbl,_si,_fr) in enumerate(_ROWS):
-        _gsi = _ri if _ri<3 else _ri+1   # skip gridspec row 3 (separator)
+        _gsi = _off+_ri if _ri<3 else _off+_ri+1   # skip separator row
         ax=fig.add_subplot(gs[_gsi])
         _gfs=[]
         for (s,e,st,lb,col,noncoding,frame) in _feats_raw:
@@ -984,20 +1179,24 @@ ${pyFeats}
             if _effective_fr!=_fr: continue
             _gfs.append(GraphicFeature(start=s,end=e,strand=_si,label=lb,color=col))
         rec=GraphicRecord(sequence_length=_seqLen,features=_gfs)
-        rec.plot(ax=ax,with_ruler=(_ri==5 and _ruler),draw_line=True)
-        ax.set_ylim(-0.55,0.55)   # keep baseline centred; half-height tracks
+        rec.plot(ax=ax,with_ruler=False,draw_line=True)
+        ax.set_ylim(-0.55,0.55)
         ax.set_facecolor(_bg)
         ax.set_ylabel(_lbl,fontsize=7,rotation=0,labelpad=22,va='center',color=_fg)
         for sp in ax.spines.values(): sp.set_color(_fg)
         ax.tick_params(colors=_fg,labelsize=${fs-2})
-        if _ri<5: ax.set_xticklabels([])
+        if _ri==5 and not _has_cov:
+            ax.xaxis.set_major_formatter(_bpfmt)
+            ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
+        else:
+            ax.set_xticklabels([])
         if _stopCod and _seq_sub:
             _sc_list=_fwd_stops[_fr] if _si==1 else _rev_stops[_fr]
             for _x in _sc_list:
                 ax.axvline(_x,color='black',alpha=0.7,linewidth=0.8)
         _axes.append(ax)
-    # Draw strand-separator axis in the blank gridspec row between +3 and -1
-    _ax_sep=fig.add_subplot(gs[3])
+    # Strand-separator line between +3 and -1
+    _ax_sep=fig.add_subplot(gs[_off+3])
     _ax_sep.set_visible(False)
     _pos3 =_axes[2].get_position()
     _pos4 =_axes[3].get_position()
@@ -1005,6 +1204,60 @@ ${pyFeats}
     from matplotlib.lines import Line2D
     fig.add_artist(Line2D([0.07,0.98],[_ymid,_ymid],transform=fig.transFigure,
         color=_fg,linewidth=0.8,linestyle='-'))
+    if _has_cov:
+        import numpy as _np
+        _xs=[(_cov_bin_off+i*_cov_bin_sz-${vs}) for i in range(len(_cov_plus))]
+        _lp=_np.log10(_np.array(_cov_plus,dtype=float)+1)
+        _lm=_np.log10(_np.array(_cov_minus,dtype=float)+1)
+        _mxp=max(float(_lp.max()) if len(_lp) else 1,0.01)
+        _mxm=max(float(_lm.max()) if len(_lm) else 1,0.01)
+        def _cov_panel(ax,xs,raw,col,label,invert=False,show_xaxis=False):
+            ax.set_facecolor(_bg)
+            for sp in ax.spines.values(): sp.set_color(_fg)
+            ax.tick_params(colors=_fg,labelsize=${fs-2})
+            ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=38,va='center',color=_fg)
+            ax.set_xlim(0,${seqLen})
+            if show_xaxis:
+                ax.xaxis.set_major_formatter(_bpfmt)
+                ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
+            else:
+                ax.set_xticklabels([])
+            if _cov_style=='reads':
+                from matplotlib.patches import Rectangle
+                from matplotlib.collections import PatchCollection
+                _rh,_rg,_mr=0.8,0.3,20
+                def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
+                _rects=[]
+                for _i,(_x,_c) in enumerate(zip(xs,raw)):
+                    if _c==0: continue
+                    _sd=_i*(67890 if invert else 12345)
+                    for _r in range(min(_mr,int(_c))):
+                        _sd=_lcg(_sd)
+                        _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
+                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
+                        _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
+                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
+                ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
+                _rd_ticks=[v for v in [5,10,20] if v<=_mr]
+                ax.set_yticks([v*(_rh+_rg) for v in _rd_ticks])
+                ax.set_yticklabels([str(v) for v in _rd_ticks],fontsize=6)
+            else:
+                lv=_np.log10(_np.array(raw,dtype=float)+1)
+                mx=max(float(lv.max()) if len(lv) else 1,0.01)
+                if _cov_style=='histogram':
+                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
+                else:
+                    _sigma=0.8; _r=int(_np.ceil(3*_sigma))
+                    _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
+                    _sm=_np.convolve(lv,_k,mode='same')
+                    ax.fill_between(xs,_sm,alpha=0.2,color=col); ax.plot(xs,_sm,color=col,linewidth=1.2)
+                ax.set_ylim(0,mx*1.1)
+                _ytv=[v for v in [1,10,100,1000,10000] if _np.log10(v+1)<=mx*1.05]
+                ax.set_yticks([_np.log10(v+1) for v in _ytv])
+                ax.set_yticklabels([str(v) for v in _ytv],fontsize=6)
+            if invert: ax.invert_yaxis()
+        _cov_panel(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+')
+        _cov_panel(fig.add_subplot(gs[-1]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',invert=True,show_xaxis=True)
     buf=io.BytesIO()
     fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
     plt.close(fig); buf.seek(0)
@@ -1023,7 +1276,7 @@ except Exception:
     return `    GraphicFeature(start=${s},end=${ee},strand=${si},label=${lbl?`'${lbl}'`:'None'},color='${col}')`;
   }).join(',\n');
   return `
-import io,base64,traceback,matplotlib
+import io,base64,traceback,matplotlib,matplotlib.gridspec as gridspec
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 _result=None
@@ -1032,16 +1285,93 @@ try:
     _f=[
 ${pyFeatsSingle}
     ]
+    _bg=${bg}; _fg=${fg}
+    _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
+    _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
+    _has_cov=_cov_style!='none' and len(_cov_plus)>0
     rec=GraphicRecord(sequence_length=${seqLen},features=_f)
-    ax,_=rec.plot(figure_width=${width},with_ruler=${ruler?'True':'False'},draw_line=True)
-    fig=ax.get_figure()
-    fig.patch.set_facecolor(${bg})
-    ax.set_facecolor(${bg})
-    for sp in ax.spines.values(): sp.set_color(${fg})
-    ax.tick_params(colors=${fg})
-    for t in ax.texts: t.set_fontsize(${fs})
+    if _has_cov:
+        import numpy as _np
+        fig=plt.figure(figsize=(${width},3.8))
+        fig.patch.set_facecolor(_bg)
+        # Layout: cov+ | genes | cov-  mirrors TUI split-track layout
+        gs=gridspec.GridSpec(3,1,figure=fig,height_ratios=[1.4,2.25,1.4],hspace=0.05,
+            top=0.95,bottom=0.06,left=0.11,right=0.98)
+        import matplotlib.ticker as _tck
+        def _gfmt(x,p):
+            v=int(x)+${vs}
+            if v>=1000000: return f'{v//1000000}M'
+            if v>=1000: return f'{v//1000}k'
+            return str(v)
+        _bpfmt=_tck.FuncFormatter(_gfmt)
+        _xs=[(_cov_bin_off+i*_cov_bin_sz-${vs}) for i in range(len(_cov_plus))]
+        _lp=_np.log10(_np.array(_cov_plus,dtype=float)+1)
+        _lm=_np.log10(_np.array(_cov_minus,dtype=float)+1)
+        _mxp=max(float(_lp.max()) if len(_lp) else 1,0.01)
+        _mxm=max(float(_lm.max()) if len(_lm) else 1,0.01)
+        def _cov_ax(ax,xs,raw,col,label,invert=False,show_xaxis=False):
+            ax.set_facecolor(_bg)
+            for sp in ax.spines.values(): sp.set_color(_fg)
+            ax.tick_params(colors=_fg,labelsize=${fs-2})
+            ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=38,va='center',color=_fg)
+            ax.set_xlim(0,${seqLen})
+            if show_xaxis:
+                ax.xaxis.set_major_formatter(_bpfmt)
+                ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
+            else:
+                ax.set_xticklabels([])
+            if _cov_style=='reads':
+                from matplotlib.patches import Rectangle
+                from matplotlib.collections import PatchCollection
+                _rh,_rg,_mr=0.8,0.3,20
+                def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
+                _rects=[]
+                for _i,(_x,_c) in enumerate(zip(xs,raw)):
+                    if _c==0: continue
+                    _sd=_i*(67890 if invert else 12345)
+                    for _r in range(min(_mr,int(_c))):
+                        _sd=_lcg(_sd)
+                        _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
+                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
+                        _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
+                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
+                ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
+                _rd_ticks=[v for v in [5,10,20] if v<=_mr]
+                ax.set_yticks([v*(_rh+_rg) for v in _rd_ticks])
+                ax.set_yticklabels([str(v) for v in _rd_ticks],fontsize=6)
+            else:
+                lv=_np.log10(_np.array(raw,dtype=float)+1)
+                mx=max(float(lv.max()) if len(lv) else 1,0.01)
+                if _cov_style=='histogram':
+                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
+                else:
+                    _sigma=0.8; _r=int(_np.ceil(3*_sigma))
+                    _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
+                    _sm=_np.convolve(lv,_k,mode='same')
+                    ax.fill_between(xs,_sm,alpha=0.2,color=col); ax.plot(xs,_sm,color=col,linewidth=1.2)
+                ax.set_ylim(0,mx*1.1)
+                _ytv=[v for v in [1,10,100,1000,10000] if _np.log10(v+1)<=mx*1.05]
+                ax.set_yticks([_np.log10(v+1) for v in _ytv])
+                ax.set_yticklabels([str(v) for v in _ytv],fontsize=6)
+            if invert: ax.invert_yaxis()
+        _cov_ax(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+')
+        ax=fig.add_subplot(gs[1])
+        rec.plot(ax=ax,with_ruler=False,draw_line=True)
+        ax.set_facecolor(_bg)
+        for sp in ax.spines.values(): sp.set_color(_fg)
+        ax.tick_params(colors=_fg); ax.set_xticklabels([])
+        for t in ax.texts: t.set_fontsize(${fs})
+        _cov_ax(fig.add_subplot(gs[2]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',invert=True,show_xaxis=True)
+    else:
+        ax,_=rec.plot(figure_width=${width},with_ruler=${ruler?'True':'False'},draw_line=True)
+        fig=ax.get_figure()
+        fig.patch.set_facecolor(_bg)
+        ax.set_facecolor(_bg)
+        for sp in ax.spines.values(): sp.set_color(_fg)
+        ax.tick_params(colors=_fg)
+        for t in ax.texts: t.set_fontsize(${fs})
     buf=io.BytesIO()
-    fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=${bg})
+    fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
     plt.close(fig); buf.seek(0)
     _result='OK:'+base64.b64encode(buf.read()).decode()
 except Exception:
@@ -1083,6 +1413,7 @@ async function triggerRender(forPng) {
         setFig(`<img src="data:image/svg+xml;base64,${b64}" style="max-width:100%">`);
         document.getElementById('btn-svg').disabled=false;
         document.getElementById('btn-png').disabled=false;
+        document.getElementById('btn-py').disabled=false;
         setFigStatus('ready');
       }
     }
@@ -1106,6 +1437,27 @@ document.getElementById('btn-svg').addEventListener('click',()=>{
   if (lastSvgData) dlBlob(new Blob([lastSvgData],{type:'image/svg+xml'}),'genetui_figure.svg');
 });
 document.getElementById('btn-png').addEventListener('click',()=>triggerRender(true));
+document.getElementById('btn-py').addEventListener('click',()=>{
+  if (!lastState) return;
+  const vs=localVS, ve=localVE;
+  let code = buildPyCode(vs, ve, false);
+  if (!code) return;
+  // Replace Pyodide-specific output with standalone savefig
+  code = code
+    .replace(/import io,base64,traceback,matplotlib\n/,'import traceback,matplotlib\n')
+    .replace(/import io,base64,traceback\n/,'import traceback\n')
+    .replace(/_result=None\n/,'')
+    .replace(/try:\n/,'try:\n')
+    .replace(/\s*_result='OK:'\+base64\.b64encode\(buf\.read\(\)\)\.decode\(\)\n/,
+             "    plt.savefig('genetui_figure.png', dpi=600, bbox_inches='tight')\n    print('Saved genetui_figure.png')\n")
+    .replace(/\s*_result='ERR:'\+traceback\.format_exc\(\)\n/,
+             "    print(traceback.format_exc())\n")
+    .replace(/buf\s*=\s*io\.BytesIO\(\)\n\s*[^\n]*\.savefig\(buf[^\n]*\)\n\s*buf\.seek\(0\)\n/g, '');
+  const files = (lastState.input_files||[]).map(f=>`#   ${f}`).join('\n');
+  const filesLine = files ? `# Source files:\n${files}\n` : '';
+  const header = `# genetui figure — ${lastState.genome_name} ${vs}–${ve}\n# Generated by genetui (https://github.com/ZacharyArdern/genetui)\n${filesLine}# Run: pip install dna_features_viewer matplotlib && python genetui_figure.py\n\n`;
+  dlBlob(new Blob([header+code],{type:'text/plain'}),'genetui_figure.py');
+});
 
 // ── 3Dmol.js structure viewer ─────────────────────────────────────────────────
 let mol3dViewer=null, mol3dLoaded=false, mol3dStyle='plddt', lastPdbName='';

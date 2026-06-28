@@ -42,6 +42,14 @@ struct Cli {
     /// BAM/SAM/CRAM file for coverage (alternative to positional)
     #[arg(long)]
     bam: Option<String>,
+
+    /// Path to DIAMOND database (.dmnd) for homolog search
+    #[arg(long)]
+    dmnd: Option<String>,
+
+    /// Path to FAMSA binary (optional; falls back to PATH then ~/Science/Programs/FAMSA/famsa)
+    #[arg(long)]
+    famsa: Option<String>,
 }
 
 fn which_minifold() -> bool {
@@ -50,6 +58,21 @@ fn which_minifold() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn find_famsa(explicit: Option<String>) -> Option<String> {
+    if let Some(p) = explicit {
+        return Some(p);
+    }
+    if std::process::Command::new("famsa").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some("famsa".to_string());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidate = format!("{}/Science/Programs/FAMSA/famsa", home);
+    if std::path::Path::new(&candidate).exists() {
+        return Some(candidate);
+    }
+    None
 }
 
 fn classify_files(cli: &Cli) -> (Option<String>, Option<String>, Option<String>) {
@@ -86,7 +109,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| ".".to_string())
     };
     let on_click_cmd: Option<String> = if let Some(ref dir) = cli.minifold_mlx {
-        // Legacy: explicit directory with predict_mlx.py script
         let dir = std::path::Path::new(dir);
         let script = dir.join("predict_mlx.py");
         let mlx_esm = dir.join("minifold_cache/checkpoints/mlx-esm2_t36_3B_UR50D_finetuned");
@@ -97,13 +119,11 @@ async fn main() -> Result<()> {
             script.display(), mlx_esm.display(), mlx_minifold.display(), out_dir
         ))
     } else if which_minifold() {
-        // pip-installed: `minifold` CLI handles weight download automatically
         Some(format!("minifold {{protein_fasta}} --out_dir {}", default_out_dir()))
     } else {
         None
     };
 
-    // Parse FASTA if provided (must happen before GFF so we have seqname offsets)
     let (genome_seq, genome_name, seqname_offsets, plasmid_entries) =
         if let Some(ref path) = fasta_path {
             let fasta = parse_fasta(path)?;
@@ -112,30 +132,25 @@ async fn main() -> Result<()> {
             (None, String::new(), HashMap::new(), Vec::new())
         };
 
-    // Parse GFF, applying per-contig coordinate offsets when available
     let (features, gff_genome_size) = parse_gff(&gff_path, &seqname_offsets)?;
 
-    // genome_size: prefer FASTA total length (accurate for concatenated contigs)
     let genome_size = genome_seq
         .as_ref()
         .map(|s| s.len() as u64)
         .unwrap_or(gff_genome_size);
 
-    // Find stop codons if we have sequence
     let stop_codons: HashMap<(char, u8), Vec<usize>> = if let Some(ref seq) = genome_seq {
         find_stop_codons(seq)
     } else {
         HashMap::new()
     };
 
-    // Compute GC skew if we have sequence
     let gc_skew: Vec<f64> = if let Some(ref seq) = genome_seq {
         compute_gc_skew(seq, 500)
     } else {
         vec![]
     };
 
-    // Build plasmid data with local (plasmid-relative) coordinates
     let plasmids: Vec<PlasmidData> = plasmid_entries
         .iter()
         .map(|entry| {
@@ -162,7 +177,6 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    // Compute BAM/SAM/CRAM coverage if provided
     let coverage = if let Some(ref bam_path) = bam_path {
         match compute_alignment_coverage(bam_path, fasta_path.as_deref(), &seqname_offsets, genome_size) {
             Ok(cov) => Some(cov),
@@ -181,16 +195,21 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir);
+    let dmnd_db   = cli.dmnd.clone();
+    let famsa_bin = find_famsa(cli.famsa.clone());
 
-    // Start web server in background
+    let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);
+    app.source_files = std::iter::once(Some(gff_path.clone()))
+        .chain([fasta_path.clone(), bam_path.clone()])
+        .filter_map(|p| p)
+        .collect();
+
     const WEB_PORT: u16 = 7890;
     let web_server = server::WebServer::new();
     let web_server2 = web_server.clone();
     tokio::spawn(async move { web_server2.run(WEB_PORT).await; });
     push_browser_state(&app, &web_server);
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -199,7 +218,6 @@ async fn main() -> Result<()> {
 
     let res = run_loop(&mut terminal, &mut app, &web_server).await;
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -217,8 +235,12 @@ async fn run_loop(
     web: &std::sync::Arc<server::WebServer>,
 ) -> Result<()> {
     let mut fold_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>> = None;
+    let mut msa_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<(String, String)>>>> = None;
 
     loop {
+        // Expire old status messages
+        app.tick_status();
+
         // Poll for completed fold result
         let mut fold_completed = false;
         if let Some(ref mut rx) = fold_rx {
@@ -245,7 +267,41 @@ async fn run_loop(
                 Err(_) => { fold_rx = None; }
             }
         }
-        if fold_completed { push_browser_state(app, web); }
+        if fold_completed {
+            // Force full redraw to clear any text that minifold wrote to the terminal.
+            terminal.clear()?;
+            push_browser_state(app, web);
+        }
+
+        // Poll for completed MSA
+        let mut msa_completed = false;
+        if let Some(ref mut rx) = msa_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let Some(ref mut panel) = app.msa {
+                        panel.loading = false;
+                        match result {
+                            Ok(seqs) => {
+                                let n = seqs.len();
+                                panel.sequences = seqs;
+                                app.set_status(format!("MSA ready: {} sequences", n));
+                            }
+                            Err(e) => {
+                                panel.error = Some(format!("{}", e));
+                                app.set_status(format!("MSA error: {}", e));
+                            }
+                        }
+                    }
+                    msa_rx = None;
+                    msa_completed = true;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => { msa_rx = None; }
+            }
+        }
+        if msa_completed {
+            terminal.clear()?;
+        }
 
         // Apply viewport commands from browser
         if let Some((vs, ve)) = web.take_viewport_cmd() {
@@ -341,23 +397,56 @@ async fn run_loop(
                             }
                             _ => {}
                         }
+                    } else if app.active_panel == crate::app::ActivePanel::Msa {
+                        if let Some(ref mut panel) = app.msa {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.msa = None;
+                                    app.active_panel = crate::app::ActivePanel::Genome;
+                                    msa_rx = None;
+                                }
+                                KeyCode::Up        | KeyCode::Char('k') => { if panel.viewport_row > 0 { panel.viewport_row -= 1; } }
+                                KeyCode::Down      | KeyCode::Char('j') => { if panel.viewport_row + 1 < panel.sequences.len() { panel.viewport_row += 1; } }
+                                KeyCode::Left      | KeyCode::Char('h') => { panel.viewport_col = panel.viewport_col.saturating_sub(1); }
+                                KeyCode::Right     | KeyCode::Char('l') => { panel.viewport_col = panel.viewport_col.saturating_add(1); }
+                                KeyCode::PageUp                         => { panel.viewport_col = panel.viewport_col.saturating_sub(20); }
+                                KeyCode::PageDown                       => { panel.viewport_col = panel.viewport_col.saturating_add(20); }
+                                KeyCode::Tab => {
+                                    app.active_panel = if app.protein.is_some() {
+                                        crate::app::ActivePanel::Protein
+                                    } else {
+                                        crate::app::ActivePanel::Genome
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
                     } else {
                         match key.code {
                             KeyCode::Esc if app.protein.is_some() => {
                                 genetui::kitty::kitty_delete();
                                 app.protein = None;
                                 app.active_panel = crate::app::ActivePanel::Genome;
+                                let _ = terminal.clear();
+                            }
+                            KeyCode::Esc if app.msa.is_some() => {
+                                app.msa = None;
+                                msa_rx = None;
+                                let _ = terminal.clear();
+                            }
+                            KeyCode::Char('m') => {
+                                start_msa_search(app, &mut msa_rx).await;
                             }
                             KeyCode::Char('f') => {
                                 start_fold(app, &mut fold_rx).await;
                             }
                             KeyCode::Tab => {
-                                if app.protein.is_some() {
-                                    app.active_panel = match app.active_panel {
-                                        crate::app::ActivePanel::Genome  => crate::app::ActivePanel::Protein,
-                                        crate::app::ActivePanel::Protein => crate::app::ActivePanel::Genome,
-                                    };
-                                }
+                                app.active_panel = match (app.protein.is_some(), app.msa.is_some(), &app.active_panel) {
+                                    (true,  _,    crate::app::ActivePanel::Genome)  => crate::app::ActivePanel::Protein,
+                                    (_,     true, crate::app::ActivePanel::Protein) => crate::app::ActivePanel::Msa,
+                                    (false, true, crate::app::ActivePanel::Genome)  => crate::app::ActivePanel::Msa,
+                                    _                                                => crate::app::ActivePanel::Genome,
+                                };
                             }
                             KeyCode::Char('a') => {
                                 if let Some(ref panel) = app.protein {
@@ -366,8 +455,8 @@ async fn run_loop(
                                         let path = format!("{}/Downloads/{}.fa", home, panel.gene_name);
                                         let content = format!(">{}\n{}\n", panel.gene_name, panel.aa_seq);
                                         match std::fs::write(&path, &content) {
-                                            Ok(_)  => app.status_msg = format!("saved: {}", path),
-                                            Err(e) => app.status_msg = format!("save failed: {}", e),
+                                            Ok(_)  => app.set_status(format!("saved: {}", path)),
+                                            Err(e) => app.set_status(format!("save failed: {}", e)),
                                         }
                                     }
                                 }
@@ -379,8 +468,8 @@ async fn run_loop(
                                         let path = format!("{}/Downloads/{}.fna", home, panel.gene_name);
                                         let content = format!(">{}\n{}\n", panel.gene_name, panel.nt_seq);
                                         match std::fs::write(&path, &content) {
-                                            Ok(_)  => app.status_msg = format!("saved: {}", path),
-                                            Err(e) => app.status_msg = format!("save failed: {}", e),
+                                            Ok(_)  => app.set_status(format!("saved: {}", path)),
+                                            Err(e) => app.set_status(format!("save failed: {}", e)),
                                         }
                                     }
                                 }
@@ -480,23 +569,25 @@ async fn run_loop(
                     let row = mouse_event.row;
                     match mouse_event.kind {
                         MouseEventKind::Down(event::MouseButton::Left) => {
-                            // Set active panel based on where user clicked
-                            if app.protein.is_some() {
-                                if rect_contains(&app.protein_panel_rect, row as usize, col as usize) {
-                                    app.active_panel = crate::app::ActivePanel::Protein;
-                                    if let Some(ref mut panel) = app.protein {
-                                        panel.drag_last = Some((col, row));
-                                    }
-                                } else {
-                                    app.active_panel = crate::app::ActivePanel::Genome;
+                            let r = row as usize; let c = col as usize;
+                            if app.msa.is_some() && rect_contains(&app.msa_panel_rect, r, c) {
+                                app.active_panel = crate::app::ActivePanel::Msa;
+                            } else if app.protein.is_some() && rect_contains(&app.protein_panel_rect, r, c) {
+                                app.active_panel = crate::app::ActivePanel::Protein;
+                                if let Some(ref mut panel) = app.protein {
+                                    panel.drag_last = Some((col, row));
                                 }
+                            } else {
+                                app.active_panel = crate::app::ActivePanel::Genome;
                             }
                             handle_hover(app, row as usize, col as usize);
                             if handle_click(app, row as usize, col as usize).await {
-                                // New gene panel opened — cancel any in-flight fold
                                 fold_rx = None;
                                 genetui::kitty::kitty_delete();
+                                // Clear any text the previous fold subprocess wrote to the terminal.
+                                let _ = terminal.clear();
                             }
+                            push_browser_state(app, web);
                         }
                         MouseEventKind::Drag(event::MouseButton::Left) => {
                             if app.active_panel == crate::app::ActivePanel::Protein {
@@ -546,12 +637,10 @@ async fn start_fold(
     let (tx, rx) = tokio::sync::oneshot::channel();
     *fold_rx = Some(rx);
 
-    // Safe gene-name identifier for PDB file lookup.
     let safe_id: String = gene_name.chars()
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
 
-    // Check for pre-computed PDB first, regardless of whether a fold command is configured.
     if let Some(ref out_dir) = app.fold_out_dir.clone() {
         let expected_pdb = format!("{}/{}.pdb", out_dir, safe_id);
         if let Ok(pdb) = std::fs::read_to_string(&expected_pdb) {
@@ -585,20 +674,36 @@ async fn start_fold(
                 let _ = std::fs::remove_file(&tmp_fasta2);
                 let result = match res {
                     Ok(out) if out.status.success() => {
-                        std::fs::read_to_string(&expected_pdb)
-                            .map_err(|e| anyhow::anyhow!(
-                                "PDB not found at {}: {}", expected_pdb, e
-                            ))
+                        match std::fs::read_to_string(&expected_pdb) {
+                            Ok(pdb) => Ok(pdb),
+                            Err(_) => {
+                                // Process exited 0 but no PDB — tool may have a length limit.
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                let extra = if !stderr.is_empty() {
+                                    format!(": {}", &stderr[..stderr.len().min(200)])
+                                } else if !stdout.is_empty() {
+                                    format!(": {}", &stdout[..stdout.len().min(200)])
+                                } else {
+                                    " (no output — sequence may exceed the tool's length limit)".into()
+                                };
+                                Err(anyhow::anyhow!("No PDB produced{}", extra.trim_end()))
+                            }
+                        }
                     }
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
-                        Err(anyhow::anyhow!("minifold stderr:\n{}", &stderr[..stderr.len().min(500)]))
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let msg = if !stderr.is_empty() { &stderr[..stderr.len().min(250)] }
+                                  else if !stdout.is_empty() { &stdout[..stdout.len().min(250)] }
+                                  else { "exited with error (no output)" };
+                        Err(anyhow::anyhow!("fold failed: {}", msg.trim()))
                     }
                     Err(e) => Err(anyhow::anyhow!("spawn: {}", e)),
                 };
                 let _ = tx.send(result);
             });
-            let _ = out_dir2; // keep alive
+            let _ = out_dir2;
         }
     } else {
         if let Some(ref mut p) = app.protein {
@@ -609,6 +714,105 @@ async fn start_fold(
     }
 }
 
+async fn start_msa_search(
+    app: &mut App,
+    msa_rx: &mut Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<(String, String)>>>>,
+) {
+    let (gene_name, aa_seq) = match app.protein.as_ref() {
+        Some(p) if !p.aa_seq.is_empty() => (p.gene_name.clone(), p.aa_seq.clone()),
+        _ => { app.set_status("Select a gene first (protein sequence needed for MSA)"); return; }
+    };
+    let dmnd_db = match app.dmnd_db.clone() {
+        Some(db) => db,
+        None => { app.set_status("No DIAMOND db specified — use --dmnd <path.dmnd>"); return; }
+    };
+    let famsa_bin = match app.famsa_bin.clone() {
+        Some(b) => b,
+        None => { app.set_status("FAMSA not found — use --famsa or add to PATH"); return; }
+    };
+
+    app.msa = Some(crate::app::MsaPanel {
+        gene_name: gene_name.clone(),
+        sequences: Vec::new(),
+        loading: true,
+        error: None,
+        viewport_row: 0,
+        viewport_col: 0,
+    });
+    app.active_panel = crate::app::ActivePanel::Msa;
+    app.set_status(format!("MSA: searching homologs of {}…", gene_name));
+
+    let pid = std::process::id();
+    let query_fa = format!("/tmp/genetui_msa_{}_query.fa", pid);
+    let hits_tsv = format!("/tmp/genetui_msa_{}_hits.tsv", pid);
+    let seqs_fa  = format!("/tmp/genetui_msa_{}_seqs.fa",  pid);
+    let aln_fa   = format!("/tmp/genetui_msa_{}_aln.fa",   pid);
+    let safe_name = gene_name.replace([' ', '/', '|'], "_");
+
+    if std::fs::write(&query_fa, format!(">{}\n{}\n", safe_name, aa_seq)).is_err() {
+        if let Some(ref mut m) = app.msa { m.loading = false; m.error = Some("Failed to write temp FASTA".into()); }
+        return;
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *msa_rx = Some(rx);
+
+    tokio::spawn(async move {
+        let result: anyhow::Result<Vec<(String, String)>> = async {
+            let out = TokioCommand::new("diamond")
+                .args(["blastp", "--db", &dmnd_db, "--query", &query_fa,
+                       "--out", &hits_tsv,
+                       "--outfmt", "6", "qseqid", "sseqid", "evalue", "bitscore", "full_sseq",
+                       "--evalue", "1e-10", "--max-target-seqs", "20",
+                       "--threads", "4", "--quiet", "--masking", "0"])
+                .output().await?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("DIAMOND: {}", &err[..err.len().min(300)]);
+            }
+
+            let query_seq = aa_seq.clone();
+            let mut seqs: Vec<(String, String)> = vec![(safe_name.clone(), query_seq)];
+            for line in std::fs::read_to_string(&hits_tsv)?.lines() {
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() >= 5 {
+                    let id  = cols[1].to_string();
+                    let seq = cols[4].replace('-', "");
+                    if !seq.is_empty() && seq != "N/A" && !seqs.iter().any(|(i,_)| i == &id) {
+                        seqs.push((id, seq));
+                    }
+                }
+            }
+            if seqs.len() < 2 { anyhow::bail!("No homologs found (e-value < 1e-10)"); }
+
+            let fasta: String = seqs.iter().map(|(id, s)| format!(">{}\n{}\n", id, s)).collect();
+            std::fs::write(&seqs_fa, fasta)?;
+
+            let out = TokioCommand::new(&famsa_bin)
+                .args([seqs_fa.as_str(), aln_fa.as_str(), "-t", "4"])
+                .output().await?;
+            if !out.status.success() {
+                anyhow::bail!("FAMSA: {}", String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>());
+            }
+
+            let aligned = std::fs::read_to_string(&aln_fa)?;
+            let mut result: Vec<(String, String)> = Vec::new();
+            let (mut cur_id, mut cur_seq) = (String::new(), String::new());
+            for line in aligned.lines() {
+                if let Some(rest) = line.strip_prefix('>') {
+                    if !cur_id.is_empty() { result.push((cur_id.clone(), cur_seq.clone())); cur_seq.clear(); }
+                    cur_id = rest.split_whitespace().next().unwrap_or("").to_string();
+                } else { cur_seq.push_str(line.trim()); }
+            }
+            if !cur_id.is_empty() { result.push((cur_id, cur_seq)); }
+
+            for f in [&query_fa, &hits_tsv, &seqs_fa, &aln_fa] { let _ = std::fs::remove_file(f); }
+            Ok(result)
+        }.await;
+        let _ = tx.send(result);
+    });
+}
+
 fn handle_hover(app: &mut App, row: usize, col: usize) {
     let hit = app
         .hit_map
@@ -617,7 +821,6 @@ fn handle_hover(app: &mut App, row: usize, col: usize) {
         .copied();
     app.hovered = hit.map(|(_, _, _, idx)| idx);
 
-    // Detect which circle map (if any) is being hovered
     if rect_contains(&app.minimap_rect, row, col) {
         app.hovered_map = Some(0);
     } else {
@@ -635,35 +838,27 @@ fn rect_contains(rect: &ratatui::layout::Rect, row: usize, col: usize) -> bool {
     && col >= rect.x as usize && col < (rect.x + rect.width) as usize
 }
 
-/// Convert a click inside a circular minimap canvas to a genomic position.
-/// Returns None if the click is outside the relevant circle area.
-/// Returns Some(pos) where pos is 1-based; inner-circle clicks → Some(1) (go to start).
 fn minimap_click_pos(area: ratatui::layout::Rect, row: usize, col: usize, genome_size: u64) -> Option<u64> {
     let w = area.width  as f64;
     let h = area.height as f64;
     if w == 0.0 || h == 0.0 { return None; }
 
-    // Same constants as draw_minimap / draw_plasmid_minimap
     const X_RANGE:    f64 = 1.1;
     const CELL_RATIO: f64 = 2.15;
-    const R_IN:       f64 = 0.82 * 0.70;   // ≈ 0.574 — inner edge of density ring
-    const CLICK_OUTER: f64 = 1.06;          // just inside the canvas boundary
+    const R_IN:       f64 = 0.82 * 0.70;
+    const CLICK_OUTER: f64 = 1.06;
 
     let y_range = X_RANGE * (CELL_RATIO * h) / w;
 
-    // Centre of the click in canvas coordinates
     let cx = (col as f64 - area.x as f64 + 0.5) / w * (2.0 * X_RANGE) - X_RANGE;
     let cy = y_range - (row as f64 - area.y as f64 + 0.5) / h * (2.0 * y_range);
 
     let dist = (cx * cx + cy * cy).sqrt();
 
     if dist < R_IN {
-        // Inside the inner circle → go to start
         Some(1)
     } else if dist <= CLICK_OUTER {
-        // On the ring → angle → genomic position
-        // Circle drawn as x = r*sin(a), y = r*cos(a)  (12-o'clock at a=0)
-        let angle = cx.atan2(cy);   // atan2(sin, cos) recovers a correctly
+        let angle = cx.atan2(cy);
         let frac  = (angle / (2.0 * std::f64::consts::PI)).rem_euclid(1.0);
         let pos   = ((frac * genome_size as f64) as u64).max(1).min(genome_size);
         Some(pos)
@@ -674,7 +869,6 @@ fn minimap_click_pos(area: ratatui::layout::Rect, row: usize, col: usize, genome
 
 /// Returns true if a new gene panel was opened (caller should reset fold_rx).
 async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
-    // Check search popup click
     if app.search_popup_open && rect_contains(&app.search_popup_rect, row, col) {
         let item = row.saturating_sub(app.search_popup_rect.y as usize + 1);
         if item < app.search_results.len() {
@@ -684,7 +878,6 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
         return false;
     }
 
-    // Check display menu click (toggle item by clicking on it)
     if app.display_menu_open && rect_contains(&app.display_menu_rect, row, col) {
         let menu_row = row.saturating_sub(app.display_menu_rect.y as usize + 1);
         if menu_row < app.display_menu_item_count() {
@@ -694,7 +887,6 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
         return false;
     }
 
-    // Check chromosome minimap click
     if rect_contains(&app.minimap_rect, row, col) {
         let genome_size = app.genome_size;
         let cur_span    = app.view_end.saturating_sub(app.view_start).max(1);
@@ -707,11 +899,11 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
         }
         return false;
     }
-    // Check plasmid circle map clicks
+
     for (i, rect) in app.plasmid_rects.clone().iter().enumerate() {
         if rect_contains(rect, row, col) {
-            let psize     = app.plasmids.get(i).map(|p| p.genome_size).unwrap_or(1);
-            let cur_span  = app.plasmids.get(i)
+            let psize    = app.plasmids.get(i).map(|p| p.genome_size).unwrap_or(1);
+            let cur_span = app.plasmids.get(i)
                 .map(|p| p.view_end.saturating_sub(p.view_start).max(1))
                 .unwrap_or(psize);
             app.switch_genome(i + 1);
@@ -725,7 +917,6 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
         }
     }
 
-    // Find the feature under the click
     let hit = app
         .hit_map
         .iter()
@@ -742,9 +933,8 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
         let feat_end    = feat.end;
         let feat_strand = feat.strand;
 
-        app.status_msg = format!("selected: {} ({})", feat_name, feat_locus);
+        app.set_status(format!("selected: {} ({})", feat_name, feat_locus));
 
-        // Extract NT + AA sequences whenever FASTA is loaded
         let seq_source: Option<String> = if app.active_genome > 0 {
             app.plasmids.get(app.active_genome - 1).map(|p| p.sequence.clone())
         } else {
@@ -762,13 +952,11 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
             };
             let aa_seq = translate(&nt_seq);
 
-            // Open protein panel
             app.open_protein_panel(feat_name.clone(), nt_seq, aa_seq.clone());
 
-            // Also run on_click_cmd if configured
             if let Some(ref cmd_template) = app.on_click_cmd.clone() {
                 if aa_seq.is_empty() {
-                    app.status_msg = format!("{}: empty translation", feat_name);
+                    app.set_status(format!("{}: empty translation", feat_name));
                     return true;
                 }
                 let label = if feat_locus.is_empty() { &feat_name } else { &feat_locus };
@@ -779,12 +967,12 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
                     start = feat_start, end = feat_end, seq = aa_seq
                 );
                 if std::fs::write(&tmp_path, &fasta_content).is_err() {
-                    app.status_msg = format!("{}: failed to write temp fasta", feat_name);
+                    app.set_status(format!("{}: failed to write temp fasta", feat_name));
                     return true;
                 }
                 let cmd = cmd_template.replace("{protein_fasta}", &tmp_path);
                 let short = if cmd.len() > 70 { format!("{}…", &cmd[..70]) } else { cmd.clone() };
-                app.status_msg = format!("▶ {} {}", feat_name, short);
+                app.set_status(format!("▶ {} {}", feat_name, short));
                 let tmp_path_clone = tmp_path.clone();
                 let feat_name_clone = feat_name.clone();
                 tokio::spawn(async move {
@@ -805,7 +993,7 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
             }
             return true;
         } else {
-            app.status_msg = format!("{}: no FASTA loaded", feat_name);
+            app.set_status(format!("{}: no FASTA loaded", feat_name));
         }
     }
     false
@@ -814,7 +1002,6 @@ async fn handle_click(app: &mut App, row: usize, col: usize) -> bool {
 const WEB_PORT: u16 = 7890;
 
 fn push_browser_state(app: &App, web: &server::WebServer) {
-    // Mirror the exact TUI palettes from ui.rs so colors match.
     const PLUS_COLORS:  &[(u8,u8,u8)] = &[
         (72,210,180),(80,170,230),(100,220,150),(55,225,200),(95,185,240),(120,215,170),
     ];
@@ -839,8 +1026,13 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         })
         .collect();
 
-    let (sequence, seq_start) = app.genome_seq.as_deref().map(|s| {
-        let center = (app.view_start as usize + app.view_end as usize) / 2;
+    let active_seq: Option<&str> = if app.active_genome == 0 {
+        app.genome_seq.as_deref()
+    } else {
+        app.plasmids.get(app.active_genome - 1).map(|p| p.sequence.as_str()).filter(|s| !s.is_empty())
+    };
+    let (sequence, seq_start) = active_seq.map(|s| {
+        let center = (app.active_view_start() as usize + app.active_view_end() as usize) / 2;
         let half   = 500_000usize;
         let vs = center.saturating_sub(half);
         let ve = (center + half).min(s.len());
@@ -852,16 +1044,43 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         .map(|p| (p.pdb_raw.clone(), p.gene_name.clone()))
         .unwrap_or_default();
 
+    // Coverage: send viewport-context bins for chromosome only
+    let (cov_plus, cov_minus, cov_bin_sz, cov_bin_start) =
+        if app.active_genome == 0 {
+            if let Some(ref cov) = app.coverage {
+                let bs   = cov.bin_size;
+                let vs   = app.active_view_start();
+                let ve   = app.active_view_end();
+                let span = ve.saturating_sub(vs);
+                let ctx_s = vs.saturating_sub(span);
+                let ctx_e = (ve + span).min(cov.genome_size);
+                let fb = (ctx_s / bs) as usize;
+                let lb = ((ctx_e / bs) as usize).min(cov.plus.len().saturating_sub(1));
+                (cov.plus[fb..=lb].to_vec(), cov.minus[fb..=lb].to_vec(), bs, fb as u64 * bs)
+            } else { (vec![], vec![], 1000, 0) }
+        } else { (vec![], vec![], 1000, 0) };
+
     web.push(server::BrowserState {
-        view_start:  app.view_start,
-        view_end:    app.view_end,
-        genome_size: app.genome_size,
-        genome_name: app.genome_name.clone(),
+        view_start:  app.active_view_start(),
+        view_end:    app.active_view_end(),
+        genome_size: app.active_genome_size(),
+        genome_name: if app.active_genome == 0 {
+            app.genome_name.clone()
+        } else {
+            app.plasmids.get(app.active_genome - 1)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| app.genome_name.clone())
+        },
         features,
         sequence,
         seq_start,
         protein_pdb,
         protein_name,
+        coverage_plus:      cov_plus,
+        coverage_minus:     cov_minus,
+        coverage_bin_size:  cov_bin_sz,
+        coverage_bin_start: cov_bin_start,
+        input_files: app.source_files.clone(),
     });
 }
 
