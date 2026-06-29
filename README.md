@@ -84,7 +84,7 @@ MIT — see [LICENSE](LICENSE).
 | Custom gene plot | [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer) | Publication-quality genomic figures (Python, runs via Pyodide) |
 | Python in browser | [Pyodide](https://pyodide.org) | CPython compiled to WASM; runs dna_features_viewer client-side |
 | Structure viewer | [3Dmol.js](https://3dmol.csb.pitt.edu) | WebGL molecular visualisation |
-| Local protein folding | [minifold-mlx](https://github.com/ZacharyArdern/MiniFold-MLX/) | Lightweight folding based on [MiniFold](https://github.com/EricAlcaide/MiniFold) by Jeremy Wohlwend & Eric Alcaide; MLX port for Apple Silicon |
+| Local protein folding | minifold-mlx | Lightweight folding based on [minifold](https://github.com/jwohlwend/minifold) by Jeremy Wohlwend; MLX port for Apple Silicon |
 | PNG rendering | [image](https://github.com/image-rs/image) + [base64](https://github.com/marshallpierce/rust-base64) | Framebuffer→PNG conversion for Kitty terminal graphics protocol |
 | Parallel computation | [rayon](https://github.com/rayon-rs/rayon) | Parallel sliding-window density and GC-skew calculations |
 | Protein TUI rendering | [ProteinView](https://github.com/001TMF/ProteinView) | `src/pv/` module (camera, framebuffer, ribbon, braille rendering) is derived from ProteinView by Tristan Farmer |
