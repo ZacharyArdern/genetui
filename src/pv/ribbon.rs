@@ -63,15 +63,15 @@ impl LodConfig {
 }
 
 /// Cross-section dimensions (in Angstroms).
-const HELIX_HALF_WIDTH: f64 = 1.17;
-const HELIX_HALF_HEIGHT: f64 = 0.40;
+const HELIX_HALF_WIDTH: f64 = 0.82;
+const HELIX_HALF_HEIGHT: f64 = 0.26;
 
-const SHEET_HALF_WIDTH: f64 = 1.50;
-const SHEET_HALF_HEIGHT: f64 = 0.20;
+const SHEET_HALF_WIDTH: f64 = 1.05;
+const SHEET_HALF_HEIGHT: f64 = 0.14;
 
-const SHEET_ARROW_HALF_WIDTH: f64 = 2.20;
+const SHEET_ARROW_HALF_WIDTH: f64 = 1.55;
 
-const COIL_RADIUS: f64 = 0.40;
+const COIL_RADIUS: f64 = 0.26;
 
 // ---------------------------------------------------------------------------
 // Output type

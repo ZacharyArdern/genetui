@@ -10,6 +10,7 @@ A fast terminal-based genome research tool written in Rust, with a live-synced b
 
 - **TUI genome browser** — six-frame translation, stop codons, coverage tracks, plasmid maps
 - **WASM web extension** — opens alongside the TUI; syncs the viewport in real time via WebSocket
+- **Circular genome maps** — sliding-window gene-density heatmaps per strand, GC skew, optional plasmid maps; clickable to navigate, draggable "you are here" arc
 - **Custom gene plot** — Pyodide + dna_features_viewer renders publication-quality figures directly in the browser, no server required
 - **Protein structure viewer** — fold any selected gene with `f` (minifold); 3Dmol.js panel appears automatically, coloured by pLDDT
 - **Six-frame translation** — correct frame assignment for both strands, stop codons as tick marks, matching between TUI and browser views
@@ -84,3 +85,5 @@ MIT — see [LICENSE](LICENSE).
 | Python in browser | [Pyodide](https://pyodide.org) | CPython compiled to WASM; runs dna_features_viewer client-side |
 | Structure viewer | [3Dmol.js](https://3dmol.csb.pitt.edu) | WebGL molecular visualisation |
 | Local protein folding | [minifold-mlx](https://github.com/ZacharyArdern/MiniFold-MLX/) | Lightweight folding based on [MiniFold](https://github.com/EricAlcaide/MiniFold) by Jeremy Wohlwend & Eric Alcaide; MLX port for Apple Silicon |
+| PNG rendering | [image](https://github.com/image-rs/image) + [base64](https://github.com/marshallpierce/rust-base64) | Framebuffer→PNG conversion for Kitty terminal graphics protocol |
+| Parallel computation | [rayon](https://github.com/rayon-rs/rayon) | Parallel sliding-window density and GC-skew calculations |

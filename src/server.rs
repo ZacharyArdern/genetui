@@ -1,10 +1,12 @@
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::f64::consts::PI;
 use tokio::sync::broadcast;
 use axum::{
     Router,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        State, Query,
     },
     response::{Html, IntoResponse},
     routing::get,
@@ -28,36 +30,69 @@ pub struct BrowserState {
     pub coverage_bin_size:  u64,        // bp per bin
     pub coverage_bin_start: u64,        // genomic position of first bin
     pub input_files: Vec<String>,       // source file paths (gff, fasta, bam)
+    pub msa_gene: String,               // gene name for the active MSA (empty = none)
+    pub msa_sequences: Vec<[String; 2]>,// [(id, aligned_sequence), …]
+    pub status_msg: String,             // progress message for slow tasks (empty = idle)
+    pub gc_skew: Vec<f32>,              // downsampled GC skew values (-1..1) for circular map (legacy, kept for compatibility)
+    pub active_genome: usize,
+    pub main_name: String,
+    pub main_size: u64,
+    pub main_features: Vec<BrowserFeature>,
+    pub main_gc_skew: Vec<f32>,
+    pub plasmid_names: Vec<String>,
+    pub plasmid_sizes: Vec<u64>,
+    pub plasmid_features: Vec<Vec<BrowserFeature>>,
+    pub plasmid_gc_skew: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct BrowserFeature {
     pub name:      String,
+    pub locus_tag: String,
     pub start:     u64,
     pub end:       u64,
     pub strand:    char,
     pub color:     String,
     pub noncoding: bool,
+    pub is_orf:    bool,
 }
 
 pub struct WebServer {
-    state:        Arc<Mutex<BrowserState>>,
-    tx:           broadcast::Sender<String>,
-    viewport_cmd: Arc<Mutex<Option<(u64, u64)>>>,
+    state:              Arc<Mutex<BrowserState>>,
+    tx:                 broadcast::Sender<String>,
+    viewport_cmd:       Arc<Mutex<Option<(u64, u64)>>>,
+    fold_gene_cmd:      Arc<Mutex<Option<String>>>,
+    msa_gene_cmd:       Arc<Mutex<Option<String>>>,
+    switch_genome_cmd:  Arc<Mutex<Option<(usize, u64, u64)>>>,
 }
 
 impl WebServer {
     pub fn new() -> Arc<Self> {
         let (tx, _) = broadcast::channel(32);
         Arc::new(Self {
-            state:        Arc::new(Mutex::new(BrowserState::default())),
+            state:             Arc::new(Mutex::new(BrowserState::default())),
             tx,
-            viewport_cmd: Arc::new(Mutex::new(None)),
+            viewport_cmd:      Arc::new(Mutex::new(None)),
+            fold_gene_cmd:     Arc::new(Mutex::new(None)),
+            msa_gene_cmd:      Arc::new(Mutex::new(None)),
+            switch_genome_cmd: Arc::new(Mutex::new(None)),
         })
     }
 
     pub fn take_viewport_cmd(&self) -> Option<(u64, u64)> {
         self.viewport_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_fold_cmd(&self) -> Option<String> {
+        self.fold_gene_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_msa_cmd(&self) -> Option<String> {
+        self.msa_gene_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_switch_cmd(&self) -> Option<(usize, u64, u64)> {
+        self.switch_genome_cmd.lock().ok()?.take()
     }
 
     /// Push new state to all connected browser clients (sync-safe, callable from event loop).
@@ -72,6 +107,17 @@ impl WebServer {
         let app = Router::new()
             .route("/",   get(serve_html))
             .route("/ws", get(ws_handler))
+            .route("/static/genome_track.js", get(|| async { ([("content-type", "application/javascript")], JS_GENOME_TRACK) }))
+            .route("/static/coverage.js",     get(|| async { ([("content-type", "application/javascript")], JS_COVERAGE) }))
+            .route("/static/navigation.js",   get(|| async { ([("content-type", "application/javascript")], JS_NAVIGATION) }))
+            .route("/static/panels.js",       get(|| async { ([("content-type", "application/javascript")], JS_PANELS) }))
+            .route("/static/gene_plot.js",    get(|| async { ([("content-type", "application/javascript")], JS_GENE_PLOT) }))
+            .route("/static/structure.js",    get(|| async { ([("content-type", "application/javascript")], JS_STRUCTURE) }))
+            .route("/static/websocket.js",    get(|| async { ([("content-type", "application/javascript")], JS_WEBSOCKET) }))
+            .route("/static/gene_info.js",    get(|| async { ([("content-type", "application/javascript")], JS_GENE_INFO) }))
+            .route("/static/msa_panel.js",      get(|| async { ([("content-type", "application/javascript")], JS_MSA_PANEL) }))
+            .route("/static/circular_plot.js", get(|| async { ([("content-type", "application/javascript")], JS_CIRCULAR_PLOT) }))
+            .route("/circular-map.svg",        get(circular_map_svg))
             .with_state(self);
 
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
@@ -82,6 +128,417 @@ impl WebServer {
 }
 
 async fn serve_html() -> Html<&'static str> { Html(HTML) }
+
+async fn circular_map_svg(
+    State(srv): State<Arc<WebServer>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dark        = params.get("dark").map(|v| v != "0").unwrap_or(true);
+    let show_nc     = params.get("nc").map(|v| v != "0").unwrap_or(false);
+    let show_legend = params.get("legend").map(|v| v != "0").unwrap_or(true);
+    let title       = params.get("title").filter(|s| !s.is_empty()).map(|s| s.as_str());
+    let genome_idx  = params.get("genome").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let state = match srv.state.lock() {
+        Ok(s) => s,
+        Err(_) => return ([("content-type", "image/svg+xml")], "<svg/>".to_string()),
+    };
+
+    let (name, size, features, gc_skew) = if genome_idx == 0 {
+        let n = if state.main_name.is_empty() { &state.genome_name } else { &state.main_name };
+        let s = if state.main_size > 0 { state.main_size } else { state.genome_size };
+        let f = if !state.main_features.is_empty() { &state.main_features } else { &state.features };
+        let g = if !state.main_gc_skew.is_empty() { &state.main_gc_skew } else { &state.gc_skew };
+        (n.clone(), s, f.clone(), g.clone())
+    } else {
+        let pi = genome_idx - 1;
+        if pi >= state.plasmid_names.len() {
+            return ([("content-type", "image/svg+xml")], "<svg/>".to_string());
+        }
+        let pfeats = state.plasmid_features.get(pi).cloned().unwrap_or_default();
+        let mut sz = state.plasmid_sizes.get(pi).copied().unwrap_or(0);
+        if sz == 0 {
+            sz = pfeats.iter().map(|f| f.end).max().unwrap_or(0);
+        }
+        (
+            state.plasmid_names[pi].clone(),
+            sz,
+            pfeats,
+            state.plasmid_gc_skew.get(pi).cloned().unwrap_or_default(),
+        )
+    };
+
+    let svg = build_circular_svg(&name, size, &features, &gc_skew, dark, show_nc, show_legend, title, genome_idx);
+    ([("content-type", "image/svg+xml")], svg)
+}
+
+fn svg_esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn lerp_color(t: f64, r0: u8, g0: u8, b0: u8, r1: u8, g1: u8, b1: u8) -> String {
+    let t = t.clamp(0.0, 1.0);
+    let r = (r0 as f64 + t * (r1 as f64 - r0 as f64)).round() as u8;
+    let g = (g0 as f64 + t * (g1 as f64 - g0 as f64)).round() as u8;
+    let b = (b0 as f64 + t * (b1 as f64 - b0 as f64)).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+fn build_circular_svg(
+    name: &str,
+    size: u64,
+    features: &[BrowserFeature],
+    gc_skew: &[f32],
+    dark: bool, show_nc: bool, show_legend: bool, custom_title: Option<&str>,
+    id_sfx: usize,
+) -> String {
+    if size == 0 { return "<svg/>".to_string(); }
+
+    let svg_w  = 1000.0f64;
+    let svg_h  = 800.0f64;
+    let cx     = 400.0f64;   // circle center X
+    let cy     = 400.0f64;   // circle center Y
+    let gsize  = size as f64;
+
+    let bg         = if dark { "#0d1117" } else { "#ffffff" };
+    let fg         = if dark { "#c9d1d9" } else { "#333333" };
+    let ring_color = if dark { "#30363d" } else { "#cccccc" };
+
+    // Track radii as fractions of cx (working inward)
+    let r_lbl_f      = 0.97f64;
+    let r_tick_o_f   = 0.94f64;
+    let r_plus_o_f   = 0.93f64;  // +strand density outer
+    let r_plus_i_f   = 0.81f64;  // +strand density inner  (12%)
+    let r_minus_o_f  = 0.80f64;  // -strand density outer
+    let r_minus_i_f  = 0.68f64;  // -strand density inner  (12%)
+    let r_nc_o_f     = 0.67f64;
+    let r_nc_i_f     = 0.59f64;
+    let (r_skew_o_f, r_skew_i_f) = if show_nc { (0.58f64, 0.49f64) } else { (0.66f64, 0.57f64) };
+    let r_inner_f    = r_skew_i_f;
+
+    // Absolute pixel values in viewBox units for JS
+    let r_outer_abs = cx * r_plus_o_f;
+    let r_inner_abs = cx * r_inner_f;
+
+    let rf = |f: f64| cx * f;
+
+    let pos_to_angle = |pos: u64| -> f64 { -PI / 2.0 + 2.0 * PI * pos as f64 / gsize };
+
+    let arc_path = |start: u64, end: u64, r_in: f64, r_out: f64| -> String {
+        let a1   = pos_to_angle(start);
+        let a2   = pos_to_angle(end);
+        let span = 2.0 * PI * (end - start) as f64 / gsize;
+        let laf  = if span > PI { 1 } else { 0 };
+        let (x1o,y1o) = (cx + r_out*a1.cos(), cy + r_out*a1.sin());
+        let (x2o,y2o) = (cx + r_out*a2.cos(), cy + r_out*a2.sin());
+        let (x1i,y1i) = (cx + r_in *a1.cos(), cy + r_in *a1.sin());
+        let (x2i,y2i) = (cx + r_in *a2.cos(), cy + r_in *a2.sin());
+        format!("M {x1o:.2} {y1o:.2} A {r_out:.2} {r_out:.2} 0 {laf} 1 {x2o:.2} {y2o:.2} \
+                 L {x2i:.2} {y2i:.2} A {r_in:.2} {r_in:.2} 0 {laf} 0 {x1i:.2} {y1i:.2} Z")
+    };
+
+    // ── Sliding-window density (per strand) ───────────────────────────────────
+    let win  = 100_000u64.min(size / 4 + 1);
+    let step = (win / 10).max(1);
+    let n_w  = ((gsize / step as f64).ceil() as usize).max(1);
+    let mut plus_c  = vec![0u64; n_w];
+    let mut minus_c = vec![0u64; n_w];
+    for f in features {
+        if f.noncoding || f.end <= f.start { continue; }
+        let first_w = if f.start >= win { ((f.start - win) / step + 1) as usize } else { 0 };
+        let last_w  = (f.end / step) as usize;
+        let counts  = if f.strand == '+' { &mut plus_c } else { &mut minus_c };
+        for wi in first_w..=last_w.min(n_w.saturating_sub(1)) {
+            let ws = wi as u64 * step;
+            let os = f.start.max(ws);
+            let oe = f.end.min(ws + win);
+            if oe > os { counts[wi] += oe - os; }
+        }
+    }
+    // Per-strand min/max for full-range normalisation
+    let plus_min  = *plus_c.iter().min().unwrap_or(&0) as f64;
+    let plus_max  = (*plus_c.iter().max().unwrap_or(&1) as f64).max(plus_min + 1.0);
+    let minus_min = *minus_c.iter().min().unwrap_or(&0) as f64;
+    let minus_max = (*minus_c.iter().max().unwrap_or(&1) as f64).max(minus_min + 1.0);
+
+    // Strand density colour ramps
+    let (p_r0,p_g0,p_b0, p_r1,p_g1,p_b1) = if dark {
+        (0x0du8,0x11u8,0x17u8, 0x39u8,0xd3u8,0x53u8)  // dark bg → green (+ strand)
+    } else {
+        (0xf0u8,0xf5u8,0xf0u8, 0x00u8,0x7au8,0x33u8)
+    };
+    let (m_r0,m_g0,m_b0, m_r1,m_g1,m_b1) = if dark {
+        (0x0du8,0x11u8,0x17u8, 0xf9u8,0x73u8,0x16u8)  // dark bg → orange (- strand)
+    } else {
+        (0xf5u8,0xf0u8,0xeeu8, 0xc0u8,0x50u8,0x00u8)
+    };
+
+    // ── GC skew min/max ───────────────────────────────────────────────────────
+    let (skew_min, skew_max) = if gc_skew.is_empty() {
+        (-1.0f64, 1.0f64)
+    } else {
+        let mn = gc_skew.iter().cloned().fold(f32::INFINITY,  f32::min) as f64;
+        let mx = gc_skew.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let pad = ((mx - mn) * 0.05).max(1e-6);
+        (mn - pad, mx + pad)
+    };
+    let skew_col_lo  = if dark { "#61afef" } else { "#2780b9" };
+    let skew_col_mid = if dark { "#21262d" } else { "#f0f0f0" };
+    let skew_col_hi  = if dark { "#e06c75" } else { "#c0392b" };
+    // Per-SVG unique IDs so multiple inline SVGs don't clash
+    let gp = format!("lg-plus-{id_sfx}");
+    let gm = format!("lg-minus-{id_sfx}");
+    let gs = format!("lg-skew-{id_sfx}");
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {svg_w} {svg_h}\" \
+         data-cx=\"{cx}\" data-cy=\"{cy}\" data-r-outer=\"{r_outer_abs:.0}\" data-r-inner=\"{r_inner_abs:.0}\">\n\
+<defs>\n\
+  <linearGradient id=\"{gp}\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\">\
+    <stop offset=\"0%\" stop-color=\"#{p_r0:02x}{p_g0:02x}{p_b0:02x}\"/>\
+    <stop offset=\"100%\" stop-color=\"#{p_r1:02x}{p_g1:02x}{p_b1:02x}\"/>\
+  </linearGradient>\n\
+  <linearGradient id=\"{gm}\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\">\
+    <stop offset=\"0%\" stop-color=\"#{m_r0:02x}{m_g0:02x}{m_b0:02x}\"/>\
+    <stop offset=\"100%\" stop-color=\"#{m_r1:02x}{m_g1:02x}{m_b1:02x}\"/>\
+  </linearGradient>\n\
+  <linearGradient id=\"{gs}\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\">\
+    <stop offset=\"0%\" stop-color=\"{skew_col_lo}\"/>\
+    <stop offset=\"50%\" stop-color=\"{skew_col_mid}\"/>\
+    <stop offset=\"100%\" stop-color=\"{skew_col_hi}\"/>\
+  </linearGradient>\n\
+</defs>\n\
+<rect width=\"{svg_w}\" height=\"{svg_h}\" fill=\"{bg}\"/>\n",
+    );
+
+    // ── Track ring outlines ────────────────────────────────────────────────────
+    for &f in &[r_plus_o_f, r_plus_i_f, r_minus_o_f, r_minus_i_f] {
+        let r = rf(f);
+        svg.push_str(&format!(
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
+"#));
+    }
+    if show_nc {
+        for &f in &[r_nc_o_f, r_nc_i_f] {
+            let r = rf(f);
+            svg.push_str(&format!(
+                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
+"#));
+        }
+    }
+    for &f in &[r_skew_o_f, r_skew_i_f] {
+        let r = rf(f);
+        svg.push_str(&format!(
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
+"#));
+    }
+
+    // ── +strand density heatmap ────────────────────────────────────────────────
+    for wi in 0..n_w {
+        let ws = wi as u64 * step;
+        if ws >= size { break; }
+        let we    = (ws + step).min(size);
+        let t     = (plus_c[wi] as f64 - plus_min) / (plus_max - plus_min);
+        let color = lerp_color(t, p_r0,p_g0,p_b0, p_r1,p_g1,p_b1);
+        let path  = arc_path(ws, we, rf(r_plus_i_f), rf(r_plus_o_f));
+        svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
+"#));
+    }
+
+    // ── -strand density heatmap ────────────────────────────────────────────────
+    for wi in 0..n_w {
+        let ws = wi as u64 * step;
+        if ws >= size { break; }
+        let we    = (ws + step).min(size);
+        let t     = (minus_c[wi] as f64 - minus_min) / (minus_max - minus_min);
+        let color = lerp_color(t, m_r0,m_g0,m_b0, m_r1,m_g1,m_b1);
+        let path  = arc_path(ws, we, rf(r_minus_i_f), rf(r_minus_o_f));
+        svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
+"#));
+    }
+
+    // ── NC feature arcs (optional) ────────────────────────────────────────────
+    if show_nc {
+        for f in features {
+            if !f.noncoding || f.end <= f.start { continue; }
+            let path = arc_path(f.start, f.end, rf(r_nc_i_f), rf(r_nc_o_f));
+            svg.push_str(&format!(r#"<path d="{path}" fill="{}" stroke="none"/>
+"#, f.color));
+        }
+    }
+
+    // ── GC skew heatmap (innermost band) ──────────────────────────────────────
+    if !gc_skew.is_empty() {
+        let n = gc_skew.len();
+        for i in 0..n {
+            let ws = (i as u64 * size) / n as u64;
+            let we = ((i + 1) as u64 * size) / n as u64;
+            if we <= ws { continue; }
+            let v = gc_skew[i] as f64;
+            // Normalise within actual data range; mid-point = 0
+            let color = if v >= 0.0 {
+                let t = (v / skew_max.max(1e-9)).clamp(0.0, 1.0);
+                if dark { lerp_color(t, 0x21,0x26,0x2d, 0xe0,0x6c,0x75) }
+                else    { lerp_color(t, 0xf0,0xf0,0xf0, 0xc0,0x39,0x2b) }
+            } else {
+                let t = (v / skew_min.min(-1e-9)).clamp(0.0, 1.0);
+                if dark { lerp_color(t, 0x21,0x26,0x2d, 0x61,0xaf,0xef) }
+                else    { lerp_color(t, 0xf0,0xf0,0xf0, 0x27,0x80,0xb9) }
+            };
+            let path = arc_path(ws, we, rf(r_skew_i_f), rf(r_skew_o_f));
+            svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
+"#));
+        }
+    }
+
+    // ── Tick marks + labels ────────────────────────────────────────────────────
+    let raw      = size / 8;
+    let mag      = 10u64.pow(raw.max(1).ilog10());
+    let interval = (raw / mag) * mag;
+    let mut pos  = 0u64;
+    while pos < size {
+        let a = pos_to_angle(pos);
+        let (ca, sa) = (a.cos(), a.sin());
+        svg.push_str(&format!(
+            r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{ring_color}" stroke-width="0.8"/>
+"#,
+            cx + rf(r_inner_f)*ca, cy + rf(r_inner_f)*sa,
+            cx + rf(r_tick_o_f)*ca, cy + rf(r_tick_o_f)*sa,
+        ));
+        let label = if pos == 0 { "0".into() }
+            else if pos >= 1_000_000 { format!("{:.1}M", pos as f64 / 1e6) }
+            else { format!("{}k", pos / 1_000) };
+        svg.push_str(&format!(
+            r#"<text x="{:.2}" y="{:.2}" text-anchor="middle" dominant-baseline="middle" font-size="11" font-family="sans-serif" fill="{fg}">{label}</text>
+"#,
+            cx + rf(r_lbl_f)*ca, cy + rf(r_lbl_f)*sa,
+        ));
+        pos += interval;
+    }
+
+    // ── Title in centre (word-wrapped) ────────────────────────────────────────
+    let title_str = custom_title.unwrap_or(name);
+    let words: Vec<&str> = title_str.split_whitespace().collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for w in &words {
+        if cur.is_empty() { cur.push_str(w); }
+        else if cur.len() + 1 + w.len() <= 18 { cur.push(' '); cur.push_str(w); }
+        else { lines.push(cur.clone()); cur = w.to_string(); }
+    }
+    if !cur.is_empty() { lines.push(cur); }
+    if lines.is_empty() { lines.push(title_str.to_string()); }
+    lines.truncate(4);
+
+    let line_h  = 15.0f64;
+    let n_lines = lines.len() as f64;
+    let y_start = cy - (n_lines - 1.0) * line_h / 2.0;
+    svg.push_str(&format!(
+        r#"<text id="circ-title-svg" font-family="sans-serif" fill="{fg}" font-weight="bold" font-size="12" text-anchor="middle" style="cursor:pointer">"#
+    ));
+    for (i, line) in lines.iter().enumerate() {
+        svg.push_str(&format!(
+            r#"<tspan x="{cx:.1}" y="{:.1}">{}</tspan>"#,
+            y_start + i as f64 * line_h, svg_esc(line)
+        ));
+    }
+    svg.push_str("</text>\n");
+
+    let mb = size as f64 / 1e6;
+    svg.push_str(&format!(
+        r#"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" dominant-baseline="middle" font-size="10" font-family="sans-serif" fill="{ring_color}">{mb:.2} Mb</text>
+"#,
+        y_start + n_lines * line_h,
+    ));
+
+    // ── Colour-bar legend (right strip, x=808..1000) ──────────────────────────
+    if show_legend {
+        let bw   = 70.0f64;      // bar width
+        let bh   = 8.0f64;       // bar height
+        let gap  = 55.0f64;      // row pitch
+        let lx   = 820.0f64;     // left edge of bars in right strip
+        let _lbl_x = lx - 4.0;  // label right-edge (unused; label goes above bar)
+
+        // Separator background for right strip
+        svg.push_str(&format!(
+            r#"<rect x="808" y="0" width="192" height="{svg_h}" fill="{bg}"/>
+"#));
+
+        // Rows: +strand, -strand, GC skew, [nc if shown]
+        struct LegRow { label: &'static str, grad: String, lo: String, hi: String }
+        let rows = {
+            let mut v = vec![
+                LegRow {
+                    label: "+ strand",
+                    grad:  gp.clone(),
+                    lo:    format!("{:.0}%", plus_min / win as f64 * 100.0),
+                    hi:    format!("{:.0}%", plus_max / win as f64 * 100.0),
+                },
+                LegRow {
+                    label: "- strand",
+                    grad:  gm.clone(),
+                    lo:    format!("{:.0}%", minus_min / win as f64 * 100.0),
+                    hi:    format!("{:.0}%", minus_max / win as f64 * 100.0),
+                },
+                LegRow {
+                    label: "GC skew",
+                    grad:  gs.clone(),
+                    lo:    format!("{:.3}", skew_min),
+                    hi:    format!("{:.3}", skew_max),
+                },
+            ];
+            if show_nc { v.push(LegRow { label: "NC feat.", grad: gp.clone(), lo: String::new(), hi: String::new() }); }
+            v
+        };
+
+        // Legend title
+        svg.push_str(&format!(
+            r#"<text x="{:.1}" y="35" text-anchor="middle" font-size="9" font-family="sans-serif" fill="{fg}" font-weight="bold">Legend</text>
+"#,
+            lx + bw / 2.0
+        ));
+
+        for (ri, row) in rows.iter().enumerate() {
+            let ry = 60.0 + ri as f64 * gap;
+            // row label above bar
+            svg.push_str(&format!(
+                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" dominant-baseline="auto" font-size="9" font-family="sans-serif" fill="{fg}">{}</text>
+"#,
+                lx + bw / 2.0, ry - 3.0, row.label
+            ));
+            if row.label == "NC feat." {
+                // Solid swatch
+                let nc_col = if dark { "#8b949e" } else { "#6e7681" };
+                svg.push_str(&format!(
+                    r#"<rect x="{lx:.1}" y="{ry:.1}" width="{bw:.1}" height="{bh:.1}" rx="1" fill="{nc_col}"/>
+"#));
+            } else {
+                // Gradient bar
+                svg.push_str(&format!(
+                    r#"<rect x="{lx:.1}" y="{ry:.1}" width="{bw:.1}" height="{bh:.1}" rx="1" fill="url(#{})"/>
+"#, row.grad));
+                // border
+                svg.push_str(&format!(
+                    r#"<rect x="{lx:.1}" y="{ry:.1}" width="{bw:.1}" height="{bh:.1}" rx="1" fill="none" stroke="{ring_color}" stroke-width="0.4"/>
+"#));
+                // lo/hi values
+                if !row.lo.is_empty() {
+                    svg.push_str(&format!(
+                        r#"<text x="{lx:.1}" y="{:.1}" text-anchor="start" dominant-baseline="auto" font-size="7" font-family="monospace" fill="{fg}">{}</text>
+"#,
+                        ry + bh + 3.0, svg_esc(&row.lo)
+                    ));
+                    svg.push_str(&format!(
+                        r#"<text x="{:.1}" y="{:.1}" text-anchor="end" dominant-baseline="auto" font-size="7" font-family="monospace" fill="{fg}">{}</text>
+"#,
+                        lx + bw, ry + bh + 3.0, svg_esc(&row.hi)
+                    ));
+                }
+            }
+        }
+    }
+
+    svg.push_str("</svg>");
+    svg
+}
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -116,6 +573,27 @@ async fn handle_ws(socket: WebSocket, server: Arc<WebServer>) {
                                     *cmd = Some((s, e));
                                 }
                             }
+                            if v["cmd"].as_str() == Some("fold") {
+                                if let Some(gene) = v["gene"].as_str() {
+                                    if let Ok(mut cmd) = server.fold_gene_cmd.lock() {
+                                        *cmd = Some(gene.to_string());
+                                    }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("msa") {
+                                if let Some(gene) = v["gene"].as_str() {
+                                    if let Ok(mut cmd) = server.msa_gene_cmd.lock() {
+                                        *cmd = Some(gene.to_string());
+                                    }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("switch_genome") {
+                                if let (Some(g), Some(s), Some(e)) = (v["genome"].as_u64(), v["start"].as_u64(), v["end"].as_u64()) {
+                                    if let Ok(mut cmd) = server.switch_genome_cmd.lock() {
+                                        *cmd = Some((g as usize, s, e));
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -126,8 +604,19 @@ async fn handle_ws(socket: WebSocket, server: Arc<WebServer>) {
     }
 }
 
-// ── Embedded web app ─────────────────────────────────────────────────────────
+// ── Static JS assets (embedded at compile time) ───────────────────────────────
+const JS_GENOME_TRACK: &str = include_str!("web/genome_track.js");
+const JS_COVERAGE:     &str = include_str!("web/coverage.js");
+const JS_NAVIGATION:   &str = include_str!("web/navigation.js");
+const JS_PANELS:       &str = include_str!("web/panels.js");
+const JS_GENE_PLOT:    &str = include_str!("web/gene_plot.js");
+const JS_STRUCTURE:    &str = include_str!("web/structure.js");
+const JS_WEBSOCKET:    &str = include_str!("web/websocket.js");
+const JS_GENE_INFO:    &str = include_str!("web/gene_info.js");
+const JS_MSA_PANEL:    &str = include_str!("web/msa_panel.js");
+const JS_CIRCULAR_PLOT: &str = include_str!("web/circular_plot.js");
 
+// ── Embedded HTML shell ───────────────────────────────────────────────────────
 const HTML: &str = r#####"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -175,6 +664,25 @@ body {
   border-top: 1px solid #30363d; border-bottom: 1px solid #30363d;
 }
 #drag-handle:hover { background: #58a6ff; }
+
+/* ── Gene info bar ───────────────────────────────────────────────────────── */
+#gene-info-bar {
+  height: 28px; padding: 0 12px; background: #0d1117; flex-shrink: 0;
+  border-top: 1px solid #21262d; border-bottom: 1px solid #21262d;
+  display: flex; align-items: center; gap: 14px; font-size: 11px;
+  font-family: monospace; overflow: hidden; transition: opacity .15s;
+}
+#gene-info-bar.empty { opacity: 0.3; }
+#gene-info-bar .gi-name  { color: #58a6ff; font-weight: 600; }
+#gene-info-bar .gi-locus { color: #8b949e; }
+#gene-info-bar .gi-coords{ color: #c9d1d9; }
+#gene-info-bar .gi-strand{ color: #e3b341; }
+#gene-info-bar .gi-len   { color: #7ee787; }
+#gene-info-bar .gi-kind  { color: #f0883e; font-size: 9px; padding: 1px 5px;
+  border: 1px solid #30363d; border-radius: 3px; }
+#gene-info-bar .gi-hint   { color: #484f58; margin-left: auto; font-size: 10px; }
+#gene-info-bar.status    { opacity: 1; }
+#gene-info-bar .gi-status{ color: #e3b341; font-style: italic; }
 
 /* ── Bottom row (structure left + gene plot right) ───────────────────────── */
 #bottom-row { flex: 1; display: flex; flex-direction: row; min-height: 0; overflow: hidden; }
@@ -228,11 +736,58 @@ body {
 .dbtn:disabled { opacity: 0.35; cursor: default; }
 #fig-output {
   flex: 1; overflow: auto; padding: 10px;
-  display: flex; justify-content: center; align-items: flex-start;
+  display: flex; justify-content: center; align-items: center;
 }
 #fig-output img { max-width: 100%; border-radius: 4px; }
 .fig-ph { color: #484f58; font-size: 12px; text-align: center; margin-top: 20px; line-height: 1.8; }
 .fig-err { color: #f85149; font-size: 11px; font-family: monospace; white-space: pre-wrap; word-break: break-all; padding: 8px; }
+
+/* ── MSA panel ───────────────────────────────────────────────────────────── */
+#msa-panel { width: 42%; min-width: 200px; display: none; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+#msa-panel.visible { display: flex; }
+#msa-h-handle {
+  width: 5px; background: #21262d; cursor: ew-resize; flex-shrink: 0;
+  border-left: 1px solid #30363d; border-right: 1px solid #30363d; display: none;
+}
+#msa-h-handle.visible { display: block; }
+#msa-h-handle:hover { background: #58a6ff; }
+#msa-bar {
+  height: 30px; padding: 0 10px; background: #161b22; border-bottom: 1px solid #30363d;
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+#msa-bar-label { font-size: 11px; color: #8b949e; }
+#msa-gene-name { font-size: 11px; color: #58a6ff; font-family: monospace; }
+#msa-status { font-size: 10px; color: #6e7681; font-family: monospace; margin-left: auto; }
+#msa-canvas-wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; position: relative; }
+#msa-canvas { display: block; cursor: default; image-rendering: pixelated; }
+#msa-names-canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+
+/* ── Circular genome map panel ───────────────────────────────────────────── */
+#circ-panel { width: 45%; min-width: 220px; display: none; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+#circ-panel.visible { display: flex; }
+#circ-h-handle {
+  width: 5px; background: #21262d; cursor: ew-resize; flex-shrink: 0;
+  border-left: 1px solid #30363d; border-right: 1px solid #30363d; display: none;
+}
+#circ-h-handle.visible { display: block; }
+#circ-h-handle:hover { background: #58a6ff; }
+#circ-bar {
+  height: 30px; padding: 0 10px; background: #161b22; border-bottom: 1px solid #30363d;
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+#circ-bar-label { font-size: 11px; color: #8b949e; }
+#circ-status { font-size: 10px; color: #6e7681; font-family: monospace; }
+#circ-body {
+  flex: 1; overflow-y: auto; overflow-x: hidden; background: #0d1117;
+}
+.circ-map-item { width: 100%; border-bottom: 1px solid #21262d; }
+.circ-map-item svg { width: 100%; height: auto; display: block; }
+#circ-opts-box {
+  position: fixed; z-index: 300;
+  background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+  padding: 12px 14px; width: 230px; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+  display: none;
+}
 
 /* ── Options dropdown ────────────────────────────────────────────────────── */
 #opts-box {
@@ -270,6 +825,12 @@ body {
 
 <!-- Resize handle -->
 <div id="drag-handle"></div>
+
+<!-- Gene info bar -->
+<div id="gene-info-bar" class="empty">
+  <span class="gi-name">—</span>
+  <span class="gi-hint">hover or click a gene in the track above</span>
+</div>
 
 <!-- Bottom row: structure (left) + custom gene plot (right) -->
 <div id="bottom-row">
@@ -311,8 +872,56 @@ body {
     </div>
   </div>
 
-  <!-- Horizontal resize handle between structure and gene plot -->
+  <!-- Horizontal resize handle between structure and MSA -->
   <div id="struct-h-handle"></div>
+
+  <!-- MSA panel (appears when MSA is run in TUI) -->
+  <div id="msa-panel">
+    <div id="msa-bar">
+      <span id="msa-bar-label">MSA</span>
+      <span id="msa-gene-name"></span>
+      <span id="msa-status">no alignment loaded — run MSA in TUI (select gene → m)</span>
+    </div>
+    <div id="msa-canvas-wrap">
+      <canvas id="msa-canvas"></canvas>
+    </div>
+  </div>
+
+  <!-- Horizontal resize handle between MSA and gene plot -->
+  <div id="msa-h-handle"></div>
+
+  <!-- Circular genome map panel -->
+  <div id="circ-panel" class="visible">
+    <div id="circ-bar">
+      <span id="circ-bar-label">Circular map</span>
+      <span id="circ-status">enable panel (d) to render</span>
+      <div style="margin-left:auto;display:flex;gap:5px">
+        <button class="dbtn" id="btn-circ-opts">&#9881; Options</button>
+        <button class="dbtn" id="btn-circ-render">Render</button>
+        <button class="dbtn" id="btn-circ-png">PNG</button>
+      </div>
+    </div>
+    <div id="circ-body">
+      <div class="fig-ph">Circular genome map — click Render to generate.</div>
+    </div>
+  </div>
+
+  <!-- Circular map options dropdown -->
+  <div id="circ-opts-box">
+    <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Circular map options</div>
+    <div class="cr" style="margin-top:4px">
+      <label for="circ-title-input" style="color:#8b949e;min-width:36px;font-size:11px">Title</label>
+      <input type="text" id="circ-title-input" placeholder="(genome name)" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 5px;font-size:11px">
+    </div>
+    <div class="cr" style="margin-top:6px"><input type="checkbox" id="circ-white"> <label for="circ-white">White background</label></div>
+    <div class="cr" style="margin-top:6px"><input type="checkbox" id="circ-show-nc"> <label for="circ-show-nc">Show NC features</label></div>
+    <div class="cr" style="margin-top:6px"><input type="checkbox" id="circ-show-legend" checked> <label for="circ-show-legend">Show colour legend</label></div>
+    <div class="cr" style="margin-top:6px"><input type="checkbox" id="circ-show-viewport" checked> <label for="circ-show-viewport">Show viewport marker</label></div>
+    <div class="cr" style="margin-top:6px"><input type="checkbox" id="circ-show-plasmids" checked> <label for="circ-show-plasmids">Show plasmids</label></div>
+  </div>
+
+  <!-- Horizontal resize handle between circular map and gene plot -->
+  <div id="circ-h-handle" class="visible"></div>
 
   <!-- Custom gene plot panel -->
   <div id="fig-panel">
@@ -395,1207 +1004,15 @@ body {
   </div>
 </div>
 
-<script>
-const NC_COLOR = '#6e7681';
-const RULER_H  = 28;
-const FH       = 19;   // frame-row height (six-frame mode)
-const LEVEL_GAP = 24;  // gene-level gap (simple mode)
-const ARROW_H  = 14;
-const STOP_COL = '#f85149';
-const STOP_SET = new Set(['TAA','TAG','TGA']);
-const COMP     = {A:'T',T:'A',G:'C',C:'G',a:'t',t:'a',g:'c',c:'g'};
-
-let lastState = null, localVS = 0, localVE = 0;
-let localMode = false, localModeTimer = null;
-let pyodide = null, pyReady = false, pyRendering = false;
-let lastSvgData = null, debounceTimer = null;
-let ws, reconnTimer, dragStart = null, dragVS0 = 0, dragVE0 = 0;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function fmt(n) {
-  if (n >= 1e6) return (n/1e6).toFixed(2)+' Mb';
-  if (n >= 1e3) return (n/1e3).toFixed(1)+' kb';
-  return n+' bp';
-}
-function trunc(s,n)  { return s.length<=n ? s : s.slice(0,n-1)+'\u2026'; }
-function esc(s)      { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function setFigStatus(m) { document.getElementById('fig-status').textContent = m; }
-function niceTick(span, W) {
-  const raw = span / Math.max(Math.floor(W/90),1);
-  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(raw,1))));
-  for (const m of [1,2,5,10]) { if (mag*m >= raw) return mag*m; }
-  return mag*10;
-}
-
-// ── Level assignment ──────────────────────────────────────────────────────────
-function assignLevels(feats, scale, vs) {
-  const ends = [];
-  return feats.map(f => {
-    const x1 = (f.start-vs)*scale, x2 = (f.end-vs)*scale;
-    let lv = 0;
-    while (ends[lv] !== undefined && ends[lv] > x1-6) lv++;
-    ends[lv] = x2+6;
-    return {...f, x1, x2, lv};
-  });
-}
-
-// ── Arrow polygon ─────────────────────────────────────────────────────────────
-function arrowPts(x1,x2,cy,h,strand) {
-  const w=x2-x1, ah=Math.min(h*.9,w*.25,10), t=cy-h/2, b=cy+h/2;
-  if (strand==='+') {
-    if (w<3) return `${x1},${t} ${x2},${cy} ${x1},${b}`;
-    return `${x1},${t} ${x2-ah},${t} ${x2},${cy} ${x2-ah},${b} ${x1},${b}`;
-  } else {
-    if (w<3) return `${x2},${t} ${x1},${cy} ${x2},${b}`;
-    return `${x2},${t} ${x1+ah},${t} ${x1},${cy} ${x1+ah},${b} ${x2},${b}`;
-  }
-}
-
-// ── Six-frame helpers ─────────────────────────────────────────────────────────
-function rcSeq(s) {
-  let r=''; for (let i=s.length-1;i>=0;i--) r += COMP[s[i]]||'N'; return r;
-}
-function stopPositions(seq, frame) {
-  const out=[], u=seq.toUpperCase();
-  for (let i=frame; i+2<u.length; i+=3) { if (STOP_SET.has(u.slice(i,i+3))) out.push(i); }
-  return out;
-}
-
-// ── SVG render ────────────────────────────────────────────────────────────────
-function drawSVG(state, vs, ve) {
-  const svgEl = document.getElementById('svg');
-  const panel = document.getElementById('live-panel');
-  const W = panel.clientWidth  || window.innerWidth;
-  const H = panel.clientHeight || 300;
-  const {genome_size, genome_name, features, sequence='', seq_start: seqOff=0} = state;
-  const span  = Math.max(ve-vs,1), scale = W/span;
-  const sixFrame = document.getElementById('opt-sixframe').checked;
-  const covStyle = document.getElementById('cov-style-svg').value;
-  const hasCovData = state.coverage_plus && state.coverage_plus.length > 0;
-  const covH = (covStyle !== 'none' && hasCovData)
-    ? parseInt(document.getElementById('cov-height').value) : 0;
-
-  document.getElementById('genome-name').textContent = genome_name || 'genome';
-  document.getElementById('position').textContent =
-    `${fmt(vs)} \u2013 ${fmt(ve)}  (${fmt(span)})`;
-
-  const out = [];
-
-  // Ruler
-  const tick=niceTick(span,W), first=Math.ceil(vs/tick)*tick;
-  out.push(`<line x1="0" y1="${RULER_H}" x2="${W}" y2="${RULER_H}" stroke="#30363d" stroke-width="1"/>`);
-  for (let pos=first; pos<=ve; pos+=tick) {
-    const x=(pos-vs)*scale;
-    out.push(`<line x1="${x|0}" y1="${RULER_H-7}" x2="${x|0}" y2="${RULER_H}" stroke="#484f58" stroke-width="1"/>`);
-    out.push(`<text x="${(x+3)|0}" y="${RULER_H-10}" font-size="10" fill="#8b949e" font-family="monospace">${fmt(pos)}</text>`);
-  }
-
-  // cov+ above gene tracks (below ruler), cov- below gene tracks — mirrors TUI layout
-  const yGeneTop = RULER_H + covH;
-  if (covH > 0) drawCoverageStrand(state, vs, ve, W, RULER_H, covH, true, out);
-  else if (covStyle !== 'none' && !hasCovData) {
-    out.push(`<rect x="0" y="${RULER_H}" width="${W}" height="20" fill="#0a0e18"/>`);
-    out.push(`<text x="${W/2|0}" y="${RULER_H+13}" text-anchor="middle" font-size="10" fill="#3d4a5e" font-family="monospace">coverage: no BAM loaded (--bam reads.bam)</text>`);
-  }
-
-  let geneBottom;
-  if (sixFrame) {
-    geneBottom = drawSixFrame(features, sequence, seqOff, vs, ve, W, scale, out, yGeneTop);
-  } else {
-    geneBottom = drawSimple(features, vs, ve, W, scale, out, yGeneTop);
-  }
-
-  if (covH > 0) drawCoverageStrand(state, vs, ve, W, geneBottom, covH, false, out);
-
-  // Minimap
-  if (genome_size > 0) {
-    const mw=Math.min(W-20,200), mh=4, mx=W-mw-8, my=H-12;
-    out.push(`<rect x="${mx}" y="${my}" width="${mw}" height="${mh}" fill="#21262d" rx="2"/>`);
-    const vx1=mx+(vs/genome_size)*mw, vx2=mx+(ve/genome_size)*mw;
-    out.push(`<rect x="${vx1|0}" y="${my}" width="${Math.max(2,(vx2-vx1))|0}" height="${mh}" fill="#58a6ff" rx="1"/>`);
-  }
-
-  svgEl.innerHTML = out.join('');
-}
-
-// ── Simple +/- track ──────────────────────────────────────────────────────────
-// Returns the Y coordinate of the bottom of the minus gene track.
-function drawSimple(features, vs, ve, W, scale, out, yTop) {
-  const SGAP = 8;
-  const plus  = assignLevels(features.filter(f=>f.strand==='+'), scale, vs);
-  const minus = assignLevels(features.filter(f=>f.strand==='-'), scale, vs);
-  const nPlus  = plus.length  ? Math.max(0,...plus.map(f=>f.lv))+1 : 0;
-  const nMinus = minus.length ? Math.max(0,...minus.map(f=>f.lv))+1 : 0;
-  const divY   = yTop + nPlus*LEVEL_GAP + SGAP;
-  out.push(`<line x1="0" y1="${divY}" x2="${W}" y2="${divY}" stroke="#21262d" stroke-width="1"/>`);
-  const drawG = (f, cy, strand) => {
-    const col = f.noncoding ? NC_COLOR : f.color;
-    const x1c=Math.max(0,f.x1), x2c=Math.min(W,f.x2);
-    if (x2c<=x1c) return;
-    const pts=arrowPts(x1c,x2c,cy,ARROW_H,strand), lw=x2c-x1c;
-    out.push(`<g class="gene"><title>${esc(f.name)}</title><polygon points="${pts}" fill="${col}" fill-opacity="0.88"/>`);
-    if (lw>24) {
-      const lbl=trunc(f.name,Math.floor(lw/6.5));
-      const ly = strand==='+'? (cy-ARROW_H/2-3):(cy+ARROW_H/2+11);
-      out.push(`<text x="${((x1c+x2c)/2)|0}" y="${ly|0}" text-anchor="middle" font-size="10" fill="#c9d1d9" font-family="monospace">${esc(lbl)}</text>`);
-    }
-    out.push('</g>');
-  };
-  plus.forEach(f  => drawG(f, divY-SGAP-ARROW_H/2-f.lv*LEVEL_GAP, '+'));
-  minus.forEach(f => drawG(f, divY+SGAP+ARROW_H/2+f.lv*LEVEL_GAP, '-'));
-  return nMinus > 0
-    ? (divY + SGAP + ARROW_H + (nMinus-1)*LEVEL_GAP + 14)|0
-    : divY + SGAP*2;
-}
-
-// ── Six-frame translation track ───────────────────────────────────────────────
-// Returns the Y coordinate of the bottom of the non-coding minus track.
-function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop) {
-  const rc      = rcSeq(seq);
-  const seqLen  = seq.length;
-  const showSC  = document.getElementById('opt-stopcodons').checked;
-  const fwdStops = [[],[],[]];
-  const revStops = [[],[],[]];
-  if (showSC && seq) {
-    for (let rcFr = 0; rcFr < 3; rcFr++) {
-      for (const p of stopPositions(seq, rcFr)) {
-        const gp = seqOff + p;
-        fwdStops[gp % 3].push(gp);
-      }
-      for (const p of stopPositions(rc, rcFr)) {
-        const gEnd = seqOff + seqLen - p - 1;
-        revStops[gEnd % 3].push(seqOff + seqLen - p - 2);
-      }
-    }
-  }
-
-  const divY = yTop + FH*3;
-  const ncYp = divY + FH*3 + 3;
-  const ncYm = ncYp + FH + 2;
-
-  // Frame row backgrounds
-  for (let fr=0;fr<3;fr++) {
-    const bg = fr%2 ? '#0f1520' : '#0d1117';
-    out.push(`<rect x="0" y="${yTop+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
-    out.push(`<rect x="0" y="${divY+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
-  }
-
-  // Strand divider
-  out.push(`<line x1="0" y1="${divY}" x2="${W}" y2="${divY}" stroke="#30363d" stroke-width="1"/>`);
-
-  // Stop codon ticks — forward
-  for (let fr=0;fr<3;fr++) {
-    const y1=yTop+FH*fr+2, y2=yTop+FH*(fr+1)-2;
-    for (const gp of fwdStops[fr]) {
-      const x=(gp-vs)*scale;
-      if (x<-1||x>W+1) continue;
-      out.push(`<line x1="${x|0}" y1="${y1}" x2="${x|0}" y2="${y2}" stroke="${STOP_COL}" stroke-width="1" opacity="0.6"/>`);
-    }
-    out.push(`<text x="3" y="${(yTop+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">+${fr+1}</text>`);
-  }
-  // Stop codon ticks — reverse
-  for (let fr=0;fr<3;fr++) {
-    const y1=divY+FH*fr+2, y2=divY+FH*(fr+1)-2;
-    for (const gp of revStops[fr]) {
-      const x=(gp-vs)*scale;
-      if (x<-1||x>W+1) continue;
-      out.push(`<line x1="${x|0}" y1="${y1}" x2="${x|0}" y2="${y2}" stroke="${STOP_COL}" stroke-width="1" opacity="0.6"/>`);
-    }
-    out.push(`<text x="3" y="${(divY+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">-${fr+1}</text>`);
-  }
-
-  // Coding genes in their frame row
-  const gh = FH-6;
-  for (const f of features) {
-    if (f.noncoding) continue;
-    const x1=(f.start-vs)*scale, x2=(f.end-vs)*scale;
-    const x1c=Math.max(0,x1), x2c=Math.min(W,x2);
-    if (x2c<=x1c) continue;
-    const col = f.color;
-    const fr  = f.strand==='+' ? (f.start-1)%3 : (f.end-1)%3;
-    const cy  = f.strand==='+' ? yTop+FH*fr+FH/2 : divY+FH*fr+FH/2;
-    const pts = arrowPts(x1c, x2c, cy, gh, f.strand);
-    const lw  = x2c-x1c;
-    out.push(`<g class="gene"><title>${esc(f.name)}</title><polygon points="${pts}" fill="${col}" fill-opacity="0.9"/>`);
-    if (lw>18) {
-      const lbl = trunc(f.name, Math.floor(lw/5.5));
-      out.push(`<text x="${((x1c+x2c)/2)|0}" y="${(cy+3)|0}" text-anchor="middle" font-size="9" fill="#fff" fill-opacity="0.85" font-family="monospace">${esc(lbl)}</text>`);
-    }
-    out.push('</g>');
-  }
-
-  // Non-coding track
-  out.push(`<line x1="0" y1="${ncYp-2}" x2="${W}" y2="${ncYp-2}" stroke="#21262d" stroke-width="1"/>`);
-  out.push(`<text x="3" y="${(ncYp+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">nc+</text>`);
-  out.push(`<text x="3" y="${(ncYm+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">nc-</text>`);
-  for (const f of features) {
-    if (!f.noncoding) continue;
-    const x1=(f.start-vs)*scale, x2=(f.end-vs)*scale;
-    const x1c=Math.max(0,x1), x2c=Math.min(W,x2);
-    if (x2c<=x1c) continue;
-    const cy = f.strand==='+' ? ncYp+FH/2 : ncYm+FH/2;
-    const pts = arrowPts(x1c, x2c, cy, FH-6, f.strand);
-    out.push(`<g class="gene"><title>${esc(f.name)}</title><polygon points="${pts}" fill="${NC_COLOR}" fill-opacity="0.7"/></g>`);
-  }
-  return ncYm + FH + 4;
-}
-
-// ── Coverage track ────────────────────────────────────────────────────────────
-function gaussSmooth1D(arr, sigma) {
-  const r=Math.ceil(3*sigma); const kern=[]; let sum=0;
-  for (let i=-r;i<=r;i++) { const w=Math.exp(-0.5*(i/sigma)**2); kern.push(w); sum+=w; }
-  kern.forEach((_,i,a)=>a[i]/=sum);
-  return arr.map((_,ci)=>{
-    let s=0;
-    for (let j=0;j<kern.length;j++) { const idx=ci+j-r; if (idx>=0&&idx<arr.length) s+=arr[idx]*kern[j]; }
-    return s;
-  });
-}
-
-// Draw one strand's coverage track. isPlus=true → bars grow up (track above gene track);
-// isPlus=false → bars grow down (track below gene track).
-function drawCoverageStrand(state, vs, ve, W, yBase, trackH, isPlus, out) {
-  const style = document.getElementById('cov-style-svg').value;
-  if (style === 'none') return;
-  const binSz  = state.coverage_bin_size  || 1000;
-  const binOff = state.coverage_bin_start || 0;
-  const data   = isPlus ? (state.coverage_plus||[]) : (state.coverage_minus||[]);
-  if (!data.length) return;
-  const span = Math.max(ve-vs,1), scaleX = W/span;
-  const col  = isPlus ? '#58a6ff' : '#f78166';
-
-  out.push(`<rect x="0" y="${yBase}" width="${W}" height="${trackH}" fill="#080d1a" opacity="0.9"/>`);
-
-  const firstBin = Math.max(0, Math.floor((vs-binOff)/binSz));
-  const lastBin  = Math.min(data.length-1, Math.ceil((ve-binOff)/binSz));
-  if (firstBin > lastBin) return;
-  const vd = data.slice(firstBin, lastBin+1);
-  const maxCov = Math.max(1, ...vd), logMax = Math.log10(maxCov+1);
-
-  const toH  = val => val<=0 ? 0 : Math.log10(val+1)/logMax * (trackH-4);
-  const bx1  = i => (binOff+(firstBin+i)*binSz-vs)*scaleX;
-  const bx2  = i => (binOff+(firstBin+i)*binSz+binSz-vs)*scaleX;
-  const bcx  = i => (bx1(i)+bx2(i))/2;
-
-  if (style === 'histogram') {
-    for (let i=0; i<vd.length; i++) {
-      if (!vd[i]) continue;
-      const x1=Math.max(0,bx1(i)), x2=Math.min(W,bx2(i)); if (x2<=x1) continue;
-      const bw=Math.max(1,x2-x1)|0, px=x1|0, h=toH(vd[i])|0;
-      const y = isPlus ? yBase+trackH-2-h : yBase+2;
-      out.push(`<rect x="${px}" y="${y}" width="${bw}" height="${h}" fill="${col}" opacity="0.75"/>`);
-    }
-  } else if (style === 'kernel') {
-    const sm = gaussSmooth1D(vd, 0.8);
-    const pts = isPlus
-      ? sm.map((_,i)=>`${bcx(i)|0},${(yBase+trackH-2-toH(sm[i]))|0}`).join(' ')
-      : sm.map((_,i)=>`${bcx(i)|0},${(yBase+2+toH(sm[i]))|0}`).join(' ');
-    const base = isPlus ? yBase+trackH-2 : yBase+2;
-    if (pts) {
-      out.push(`<polygon points="${pts} ${W},${base} 0,${base}" fill="${col}" opacity="0.2"/>`);
-      out.push(`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" opacity="0.9"/>`);
-    }
-  } else { // reads
-    const rh=2, rg=1, maxR=Math.floor((trackH-6)/(rh+rg));
-    function lcg(s) { return (Math.imul(s,1664525)+1013904223)|0; }
-    for (let i=0; i<vd.length; i++) {
-      const x1=Math.max(0,bx1(i))|0, x2=Math.min(W,bx2(i))|0; if (x2<=x1) continue;
-      const bw=x2-x1;
-      let seed=(firstBin+i)*(isPlus?12345:67890);
-      for (let r=0; r<Math.min(maxR,vd[i]); r++) {
-        seed=lcg(seed);
-        const rw=Math.max(3,(bw*0.55+((seed&0xff)/256-0.5)*bw*0.3))|0;
-        const rx=x1+Math.max(0,(((seed>>8)&0xff)/256)*(bw-rw))|0;
-        if (isPlus) {
-          const ry=yBase+trackH-4-r*(rh+rg); if (ry<yBase+2) break;
-          out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
-        } else {
-          const ry=yBase+3+r*(rh+rg); if (ry+rh>yBase+trackH-2) break;
-          out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
-        }
-      }
-    }
-  }
-
-  // Label + log-scale y-axis ticks
-  out.push(`<text x="3" y="${isPlus?yBase+trackH-3:yBase+9}" font-size="7" fill="#484f58" font-family="monospace">${isPlus?'cov+':'cov-'}</text>`);
-  for (const lv of [1,10,100,1000,10000]) {
-    if (lv > maxCov*1.5) break;
-    const h = toH(lv);
-    const y = isPlus ? yBase+trackH-2-h : yBase+2+h;
-    if (isPlus && y < yBase+4) break;
-    if (!isPlus && y > yBase+trackH-4) break;
-    out.push(`<line x1="0" y1="${y|0}" x2="5" y2="${y|0}" stroke="#2d3547" stroke-width="1"/>`);
-    out.push(`<text x="7" y="${(y+3)|0}" font-size="7" fill="#3d4a5e" font-family="monospace">${lv<1000?lv:lv/1000+'k'}</text>`);
-  }
-}
-
-function renderLocal() { if (lastState) drawSVG(lastState, localVS, localVE); }
-
-function clampLocal() {
-  const gs = lastState ? (lastState.genome_size||0) : 0;
-  const span = localVE-localVS;
-  if (gs>0) {
-    if (localVS<0) { localVS=0; localVE=span; }
-    if (localVE>gs) { localVE=gs; localVS=Math.max(0,gs-span); }
-  }
-  localVS = Math.max(0, localVS);
-}
-
-let vpSendTimer = null;
-function sendViewport() {
-  if (ws && ws.readyState===WebSocket.OPEN)
-    ws.send(JSON.stringify({start: localVS, end: localVE}));
-}
-function enterLocalMode() {
-  localMode = true;
-  clearTimeout(localModeTimer);
-  localModeTimer = setTimeout(() => { localMode=false; }, 8000);
-  clearTimeout(vpSendTimer);
-  vpSendTimer = setTimeout(sendViewport, 200);
-}
-
-// ── Navigation — wheel (on document, path-checked) ────────────────────────────
-document.addEventListener('wheel', e => {
-  const panel = document.getElementById('live-panel');
-  if (!e.composedPath().some(el => el===panel)) return;
-  e.preventDefault();
-  if (!lastState) return;
-  enterLocalMode();
-  const rect=panel.getBoundingClientRect(), frac=(e.clientX-rect.left)/panel.clientWidth;
-  const span=localVE-localVS, factor=e.deltaY>0?1.18:1/1.18;
-  const newSpan=Math.max(10,span*factor), center=localVS+frac*span;
-  localVS=Math.round(center-frac*newSpan);
-  localVE=Math.round(localVS+newSpan);
-  clampLocal(); renderLocal(); scheduleAutoRender();
-}, {passive:false});
-
-// Drag pan
-document.getElementById('live-panel').addEventListener('mousedown', e => {
-  if (e.button!==0) return;
-  dragStart=e.clientX; dragVS0=localVS; dragVE0=localVE;
-  document.getElementById('live-panel').classList.add('dragging');
-});
-document.addEventListener('mousemove', e => {
-  if (dragStart===null) return;
-  enterLocalMode();
-  const p=document.getElementById('live-panel');
-  const dx=e.clientX-dragStart, span=dragVE0-dragVS0;
-  localVS=dragVS0+Math.round(-(dx/(p.clientWidth||1))*span);
-  localVE=dragVE0+Math.round(-(dx/(p.clientWidth||1))*span);
-  clampLocal(); renderLocal();
-});
-document.addEventListener('mouseup', () => {
-  if (dragStart!==null) {
-    dragStart=null;
-    document.getElementById('live-panel').classList.remove('dragging');
-    scheduleAutoRender();
-  }
-});
-
-// Arrow keys
-document.addEventListener('keydown', e => {
-  if (!lastState) return;
-  const tag=document.activeElement&&document.activeElement.tagName;
-  if (tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA') return;
-  const span=localVE-localVS, step=Math.max(1,Math.round(span*.12));
-  let changed=true;
-  switch(e.key) {
-    case 'ArrowLeft':  localVS-=step; localVE-=step; break;
-    case 'ArrowRight': localVS+=step; localVE+=step; break;
-    case 'ArrowUp':   {const d=Math.round(span*.15); localVS+=d; localVE-=d; break;}
-    case 'ArrowDown': {const d=Math.round(span*.15); localVS-=d; localVE+=d; break;}
-    case '+': case '=': {const d=Math.round(span*.15); localVS+=d; localVE-=d; break;}
-    case '-':           {const d=Math.round(span*.15); localVS-=d; localVE+=d; break;}
-    default: changed=false;
-  }
-  if (!changed) return;
-  e.preventDefault();
-  enterLocalMode(); clampLocal(); renderLocal(); scheduleAutoRender();
-});
-
-window.addEventListener('resize', renderLocal);
-
-// Drag-resize handle
-(function(){
-  const h=document.getElementById('drag-handle');
-  const p=document.getElementById('live-panel');
-  let drag=false, sy=0, sh=0;
-  h.addEventListener('mousedown', e=>{drag=true;sy=e.clientY;sh=p.offsetHeight;e.preventDefault();});
-  document.addEventListener('mousemove', e=>{
-    if (!drag) return;
-    p.style.height=Math.max(60,Math.min(sh+e.clientY-sy,window.innerHeight-160))+'px';
-    renderLocal();
-  });
-  document.addEventListener('mouseup', ()=>{drag=false;});
-})();
-
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => {
-    document.getElementById('status').className='badge connected';
-    document.getElementById('status').textContent='live';
-    clearTimeout(reconnTimer);
-  };
-  ws.onmessage = ev => {
-    try {
-      const state=JSON.parse(ev.data);
-      state.features.forEach((f,i)=>{f._idx=i;});
-      lastState=state;
-      if (!localMode) {localVS=state.view_start; localVE=state.view_end;}
-      renderLocal();
-      scheduleAutoRender();
-      if (state.protein_pdb) updateStructure(state.protein_pdb, state.protein_name||'protein');
-    } catch(_) {}
-  };
-  ws.onclose = () => {
-    document.getElementById('status').className='badge disconnected';
-    document.getElementById('status').textContent='reconnecting\u2026';
-    reconnTimer=setTimeout(connect,2000);
-  };
-  ws.onerror = () => ws.close();
-}
-connect();
-
-// ── Options dropdown (anchored to btn-opts, draggable) ───────────────────────
-(function(){
-  const btn=document.getElementById('btn-opts');
-  const box=document.getElementById('opts-box');
-  let open=false, dragging=false, ox=0, oy=0, mx=0, my=0;
-
-  function positionBox() {
-    const r=btn.getBoundingClientRect();
-    // Prefer anchoring below-right, flip if near right edge
-    let left=r.right-box.offsetWidth;
-    if (left<4) left=4;
-    const top=r.bottom+4;
-    box.style.left=left+'px'; box.style.top=top+'px';
-    box.style.right='auto'; box.style.bottom='auto';
-  }
-
-  btn.addEventListener('click', function(e) {
-    e.stopPropagation();
-    open=!open;
-    box.style.display=open?'block':'none';
-    btn.classList.toggle('active',open);
-    if (open) positionBox();
-  });
-
-  document.addEventListener('click', e=>{
-    if (open && !box.contains(e.target) && e.target!==btn) {
-      open=false; box.style.display='none'; btn.classList.remove('active');
-    }
-  });
-
-  // Draggable by header
-  box.querySelector('h3').style.cursor='move';
-  box.querySelector('h3').addEventListener('mousedown', e=>{
-    dragging=true; mx=e.clientX; my=e.clientY;
-    const r=box.getBoundingClientRect(); ox=r.left; oy=r.top;
-    e.preventDefault();
-  });
-  document.addEventListener('mousemove', e=>{
-    if (!dragging) return;
-    box.style.left=(ox+e.clientX-mx)+'px';
-    box.style.top=(oy+e.clientY-my)+'px';
-  });
-  document.addEventListener('mouseup', ()=>{dragging=false;});
-})();
-
-// Auto-render on any figure option change
-function optionChanged() { renderLocal(); scheduleAutoRender(); }
-['opt-sixframe','opt-stopcodons','fig-ruler','fig-white','fig-show-labels','fig-hide-long-labels'].forEach(id=>{
-  document.getElementById(id).addEventListener('change', optionChanged);
-});
-[['fig-width','lbl-width',1],['fig-fs','lbl-fs',0],['fig-overflow-thresh','lbl-overflow-thresh',3]].forEach(([id,lb,d])=>{
-  document.getElementById(id).addEventListener('input', function(){
-    document.getElementById(lb).textContent=parseFloat(this.value).toFixed(d);
-    scheduleAutoRender();
-  });
-});
-document.getElementById('fig-hide-long-labels').addEventListener('change', function(){
-  document.getElementById('overflow-thresh-row').style.display = this.checked ? '' : 'none';
-});
-document.getElementById('cov-style-fig').addEventListener('change', function(){
-  scheduleAutoRender();
-});
-
-// ── Panel selector (d key) ────────────────────────────────────────────────────
-(function(){
-  // struct-panel is only included when protein data is present — always listed but
-  // its checkbox stays disabled until structure data arrives.
-  const PANELS=[
-    {id:'live-panel',   label:'Synced browser'},
-    {id:'fig-panel',    label:'Custom gene plot'},
-    {id:'struct-panel', label:'Structure viewer'},
-  ];
-  const panelCbs={};
-  const ov=document.createElement('div');
-  ov.id='panel-sel-overlay';
-  ov.style.cssText='display:none;position:fixed;inset:0;z-index:300;';
-  const box=document.createElement('div');
-  box.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);'
-    +'background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px;'
-    +'min-width:240px;box-shadow:0 8px 32px rgba(0,0,0,.6);z-index:301;';
-  box.innerHTML='<div style="font-size:11px;color:#8b949e;text-transform:uppercase;'
-    +'letter-spacing:.06em;margin-bottom:10px">Panels  <span style="font-size:9px;color:#484f58">(d)</span></div>';
-  PANELS.forEach(p=>{
-    const row=document.createElement('div');
-    row.style.cssText='display:flex;align-items:center;gap:8px;margin:6px 0;font-size:12px;color:#c9d1d9;';
-    const cb=document.createElement('input'); cb.type='checkbox';
-    cb.style.accentColor='#58a6ff';
-    // struct-panel starts hidden & unchecked until protein data arrives
-    const isStruct=(p.id==='struct-panel');
-    cb.checked=!isStruct; cb.disabled=isStruct;
-    cb.addEventListener('change', ()=>{
-      const el=document.getElementById(p.id);
-      if (!el) return;
-      if (p.id==='live-panel') {
-        el.style.display=cb.checked?'':'none';
-        document.getElementById('drag-handle').style.display=cb.checked?'':'none';
-      } else if (p.id==='struct-panel') {
-        el.classList.toggle('visible', cb.checked);
-        document.getElementById('struct-h-handle').classList.toggle('visible', cb.checked);
-      } else {
-        el.style.display=cb.checked?'':'none';
-      }
-    });
-    panelCbs[p.id]=cb;
-    const lbl=document.createElement('label'); lbl.textContent=p.label;
-    row.append(cb,lbl); box.appendChild(row);
-  });
-  // Coverage style row (controls SVG live track only)
-  const covSep = document.createElement('div');
-  covSep.style.cssText='border-top:1px solid #21262d;margin:10px 0 8px;';
-  box.appendChild(covSep);
-  const covRow = document.createElement('div');
-  covRow.style.cssText='display:flex;align-items:center;gap:8px;font-size:12px;color:#c9d1d9;';
-  const covLbl = document.createElement('span'); covLbl.textContent='Coverage (live)';
-  covLbl.style.cssText='min-width:80px;color:#8b949e;';
-  const covSel = document.createElement('select');
-  covSel.id = 'cov-style-svg';
-  covSel.style.cssText='background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 4px;font-size:11px;';
-  [['none','None'],['histogram','Histogram'],['kernel','Kernel'],['reads','Raw reads']].forEach(([v,l])=>{
-    const o=document.createElement('option'); o.value=v; o.textContent=l; covSel.appendChild(o);
-  });
-  const covHRow = document.createElement('div');
-  covHRow.id='cov-height-row';
-  covHRow.style.cssText='display:none;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;margin-top:6px;';
-  const covHLbl = document.createElement('span'); covHLbl.textContent='Height';
-  covHLbl.style.cssText='min-width:80px;color:#8b949e;';
-  const covHIn = document.createElement('input');
-  covHIn.type='range'; covHIn.id='cov-height'; covHIn.min=30; covHIn.max=150; covHIn.step=5; covHIn.value=70;
-  covHIn.style.cssText='width:90px;';
-  const covHVal = document.createElement('span'); covHVal.id='lbl-cov-height'; covHVal.textContent='70';
-  covHVal.style.cssText='min-width:24px;font-size:11px;color:#8b949e;';
-  covHRow.append(covHLbl, covHIn, covHVal, Object.assign(document.createElement('span'),{textContent:'px',style:'font-size:10px;color:#8b949e;'}));
-  covSel.addEventListener('change', ()=>{
-    covHRow.style.display = covSel.value !== 'none' ? 'flex' : 'none';
-    renderLocal();
-  });
-  covHIn.addEventListener('input', ()=>{
-    covHVal.textContent = covHIn.value;
-    renderLocal();
-  });
-  covRow.append(covLbl, covSel); box.appendChild(covRow); box.appendChild(covHRow);
-
-  ov.appendChild(box); document.body.appendChild(ov);
-  window._panelCbs=panelCbs;  // expose so struct viewer can enable checkbox
-  function toggleSel() {
-    const open=ov.style.display==='none';
-    ov.style.display=open?'block':'none';
-  }
-  ov.addEventListener('click', e=>{if(e.target===ov) ov.style.display='none';});
-  document.addEventListener('keydown', e=>{
-    if (e.key==='d'||e.key==='D') {
-      const tag=document.activeElement&&document.activeElement.tagName;
-      if (tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA') return;
-      toggleSel();
-    }
-  });
-})();
-
-// ── Pyodide ───────────────────────────────────────────────────────────────────
-async function initPyodide() {
-  const badge=document.getElementById('py-badge');
-  badge.style.display=''; badge.textContent='py\u2026';
-  setFigStatus('loading Pyodide\u2026');
-  try {
-    pyodide = await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/'});
-    setFigStatus('installing packages\u2026');
-    await pyodide.loadPackage(['micropip','matplotlib','numpy']);
-    await pyodide.runPythonAsync('import micropip\nawait micropip.install("dna_features_viewer", keep_going=True)');
-    badge.textContent='py ready'; badge.className='badge ready';
-    setFigStatus('ready \u2014 renders when scrolling stops');
-    pyReady=true;
-    document.getElementById('btn-render').disabled=false;
-    if (lastState) scheduleAutoRender();
-  } catch(err) {
-    badge.textContent='py error'; badge.style.background='#da3633';
-    setFigStatus('Pyodide error');
-    document.getElementById('fig-output').innerHTML=`<pre class="fig-err">${esc(String(err))}</pre>`;
-  }
-}
-(function(){
-  const s=document.createElement('script');
-  s.src='https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
-  s.onload=()=>initPyodide();
-  s.onerror=()=>{
-    document.getElementById('py-badge').style.display='';
-    document.getElementById('py-badge').textContent='offline';
-    setFigStatus('CDN unavailable');
-  };
-  document.head.appendChild(s);
-})();
-
-// ── Auto-render debounce (always on) ─────────────────────────────────────────
-function scheduleAutoRender() {
-  if (!pyReady) return;
-  clearTimeout(debounceTimer);
-  debounceTimer=setTimeout(()=>triggerRender(false), 700);
-}
-
-// ── Python code builder ───────────────────────────────────────────────────────
-function buildPyCode(vs,ve,forPng) {
-  if (!lastState) return null;
-  const width     = parseFloat(document.getElementById('fig-width').value);
-  const fs        = parseInt(document.getElementById('fig-fs').value);
-  const showLbls  = document.getElementById('fig-show-labels').checked;
-  const hideLong  = document.getElementById('fig-hide-long-labels').checked;
-  const ruler     = document.getElementById('fig-ruler').checked;
-  const white     = document.getElementById('fig-white').checked;
-  const sixframe  = document.getElementById('opt-sixframe').checked;
-  const stopCod   = document.getElementById('opt-stopcodons').checked;
-  const seqLen    = Math.max(1,ve-vs);
-  const feats     = lastState.features.filter(f=>f.start<=ve&&f.end>=vs);
-  const bg        = white?"'white'":"'#0d1117'";
-  const fg        = white?"'#111'":"'#c9d1d9'";
-  const dpi       = forPng?600:96;
-  const fmt_      = forPng?'png':'svg';
-
-  // Coverage data for subplot
-  const covStyle   = document.getElementById('cov-style-fig').value;
-  const covBinSz   = lastState.coverage_bin_size  || 1000;
-  const covBinOff  = lastState.coverage_bin_start || 0;
-  const covPlus    = lastState.coverage_plus  || [];
-  const covMinus   = lastState.coverage_minus || [];
-  let pyCovPlus = '[]', pyCovMinus = '[]', pyCovBinSz = covBinSz, pyCovBinOff = 0;
-  if (covStyle !== 'none' && covPlus.length) {
-    const fb = Math.max(0, Math.floor((vs - covBinOff) / covBinSz));
-    const lb = Math.min(covPlus.length - 1, Math.ceil((ve - covBinOff) / covBinSz));
-    if (fb <= lb) {
-      pyCovPlus   = JSON.stringify(covPlus.slice(fb, lb+1));
-      pyCovMinus  = JSON.stringify(covMinus.slice(fb, lb+1));
-      pyCovBinOff = covBinOff + fb * covBinSz;
-    }
-  }
-  const hasCov = covStyle !== 'none' && pyCovPlus !== '[]';
-
-  // Approximate character width at current font size (inches per char, tuned to dna_features_viewer defaults)
-  const charWidthIn = (fs / 11) * parseFloat(document.getElementById('fig-overflow-thresh').value);
-  function labelFitsInFeature(f) {
-    const visibleBp = Math.min(f.end, ve) - Math.max(f.start, vs);
-    const featWidthIn = visibleBp / seqLen * width;
-    return featWidthIn >= f.name.length * charWidthIn;
-  }
-
-  // Build feature tuples: (start_rel, end_rel, strand_int, label, color, noncoding, frame)
-  const pyFeats = feats.map(f=>{
-    const lbl = showLbls && !(hideLong && !labelFitsInFeature(f)) ? f.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'") : '';
-    const col = f.noncoding ? NC_COLOR : f.color;
-    const s  = Math.max(0, f.start-vs);
-    const ee = Math.min(seqLen, f.end-vs);
-    const si = f.strand==='+'?1:-1;
-    const fr = f.strand==='+'? (f.start-1)%3 : (f.end-1)%3;
-    return `    (${s},${ee},${si},${lbl?`'${lbl}'`:'None'},'${col}',${f.noncoding?'True':'False'},${fr})`;
-  }).join(',\n');
-
-  if (sixframe) {
-    return `
-import io,base64,traceback,matplotlib,matplotlib.gridspec as gridspec
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-_result=None
-try:
-    from dna_features_viewer import GraphicRecord,GraphicFeature
-    _bg=${bg}; _fg=${fg}
-    _seqLen=${seqLen}; _width=${width}; _ruler=${ruler?'True':'False'}
-    _stopCod=${stopCod?'True':'False'}
-    _feats_raw=[
-${pyFeats}
-    ]
-    _STOP={'TAA','TAG','TGA'}
-    _COMP={'A':'T','T':'A','G':'C','C':'G'}
-    def _rc(s):
-        return ''.join(_COMP.get(c,'N') for c in reversed(s.upper()))
-    _seq_sub=globals().get('_seq_sub',''); _seq_sub_off=globals().get('_seq_sub_off',0)
-    # Genomic start of _seq_sub (used to compute absolute genomic frame of each codon)
-    _geno_off=${vs}+_seq_sub_off
-    # Pre-bin stop codons by absolute genomic frame so they align with gene frames.
-    # Gene frame: start%3 (+) or end%3 (-) — both absolute genomic coords.
-    _fwd_stops=[[],[],[]]
-    _rev_stops=[[],[],[]]
-    if _stopCod and _seq_sub:
-        _u=_seq_sub.upper()
-        _rc_u=_rc(_seq_sub)
-        for _i in range(len(_u)-2):
-            if _u[_i:_i+3] in _STOP:
-                _gfr=(_geno_off+_i)%3
-                _fwd_stops[_gfr].append(_seq_sub_off+_i)  # viewport-relative x
-        for _i in range(len(_rc_u)-2):
-            if _rc_u[_i:_i+3] in _STOP:
-                _gend=_geno_off+len(_seq_sub)-_i-1
-                _gfr=_gend%3
-                _rev_stops[_gfr].append(_seq_sub_off+len(_seq_sub)-_i-2)
-    # 6 rows: +1 +2 +3  -1 -2 -3  (strand_int, absolute_genomic_frame 0/1/2)
-    _ROWS=[('+1',1,0),('+2',1,1),('+3',1,2),('-1',-1,0),('-2',-1,1),('-3',-1,2)]
-    _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
-    _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
-    _has_cov=_cov_style!='none' and len(_cov_plus)>0
-    # Layout: [cov+,] +1,+2,+3, sep, -1,-2,-3 [,cov-]
-    _hr=([1.4] if _has_cov else [])+[0.75,0.75,0.75,0.25,0.75,0.75,0.75]+([1.4] if _has_cov else [])
-    _off=1 if _has_cov else 0   # gridspec offset for cov+ row
-    _fig_h=6*0.29+0.55+(1.6 if _has_cov else 0)
-    fig=plt.figure(figsize=(_width,_fig_h))
-    fig.patch.set_facecolor(_bg)
-    gs=gridspec.GridSpec(len(_hr),1,figure=fig,hspace=0.0,
-        height_ratios=_hr,top=0.96,bottom=0.06,left=0.11,right=0.98)
-    import matplotlib.ticker as _tck
-    def _gfmt(x,p):
-        v=int(x)+${vs}
-        if v>=1000000: return f'{v//1000000}M'
-        if v>=1000: return f'{v//1000}k'
-        return str(v)
-    _bpfmt=_tck.FuncFormatter(_gfmt)
-    _axes=[]
-    for _ri,(_lbl,_si,_fr) in enumerate(_ROWS):
-        _gsi = _off+_ri if _ri<3 else _off+_ri+1   # skip separator row
-        ax=fig.add_subplot(gs[_gsi])
-        _gfs=[]
-        for (s,e,st,lb,col,noncoding,frame) in _feats_raw:
-            if st!=_si: continue
-            _effective_fr=0 if noncoding else frame
-            if _effective_fr!=_fr: continue
-            _gfs.append(GraphicFeature(start=s,end=e,strand=_si,label=lb,color=col))
-        rec=GraphicRecord(sequence_length=_seqLen,features=_gfs)
-        rec.plot(ax=ax,with_ruler=False,draw_line=True)
-        ax.set_ylim(-0.55,0.55)
-        ax.set_facecolor(_bg)
-        ax.set_ylabel(_lbl,fontsize=7,rotation=0,labelpad=22,va='center',color=_fg)
-        for sp in ax.spines.values(): sp.set_color(_fg)
-        ax.tick_params(colors=_fg,labelsize=${fs-2})
-        if _ri==5 and not _has_cov:
-            ax.xaxis.set_major_formatter(_bpfmt)
-            ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
-        else:
-            ax.set_xticklabels([])
-        if _stopCod and _seq_sub:
-            _sc_list=_fwd_stops[_fr] if _si==1 else _rev_stops[_fr]
-            for _x in _sc_list:
-                ax.axvline(_x,color='black',alpha=0.7,linewidth=0.8)
-        _axes.append(ax)
-    # Strand-separator line between +3 and -1
-    _ax_sep=fig.add_subplot(gs[_off+3])
-    _ax_sep.set_visible(False)
-    _pos3 =_axes[2].get_position()
-    _pos4 =_axes[3].get_position()
-    _ymid =(_pos3.y0+_pos4.y1)/2
-    from matplotlib.lines import Line2D
-    fig.add_artist(Line2D([0.07,0.98],[_ymid,_ymid],transform=fig.transFigure,
-        color=_fg,linewidth=0.8,linestyle='-'))
-    if _has_cov:
-        import numpy as _np
-        _xs=[(_cov_bin_off+i*_cov_bin_sz-${vs}) for i in range(len(_cov_plus))]
-        _lp=_np.log10(_np.array(_cov_plus,dtype=float)+1)
-        _lm=_np.log10(_np.array(_cov_minus,dtype=float)+1)
-        _mxp=max(float(_lp.max()) if len(_lp) else 1,0.01)
-        _mxm=max(float(_lm.max()) if len(_lm) else 1,0.01)
-        def _cov_panel(ax,xs,raw,col,label,invert=False,show_xaxis=False):
-            ax.set_facecolor(_bg)
-            for sp in ax.spines.values(): sp.set_color(_fg)
-            ax.tick_params(colors=_fg,labelsize=${fs-2})
-            ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=38,va='center',color=_fg)
-            ax.set_xlim(0,${seqLen})
-            if show_xaxis:
-                ax.xaxis.set_major_formatter(_bpfmt)
-                ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
-            else:
-                ax.set_xticklabels([])
-            if _cov_style=='reads':
-                from matplotlib.patches import Rectangle
-                from matplotlib.collections import PatchCollection
-                _rh,_rg,_mr=0.8,0.3,20
-                def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
-                _rects=[]
-                for _i,(_x,_c) in enumerate(zip(xs,raw)):
-                    if _c==0: continue
-                    _sd=_i*(67890 if invert else 12345)
-                    for _r in range(min(_mr,int(_c))):
-                        _sd=_lcg(_sd)
-                        _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
-                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
-                        _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
-                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
-                ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
-                _rd_ticks=[v for v in [5,10,20] if v<=_mr]
-                ax.set_yticks([v*(_rh+_rg) for v in _rd_ticks])
-                ax.set_yticklabels([str(v) for v in _rd_ticks],fontsize=6)
-            else:
-                lv=_np.log10(_np.array(raw,dtype=float)+1)
-                mx=max(float(lv.max()) if len(lv) else 1,0.01)
-                if _cov_style=='histogram':
-                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
-                else:
-                    _sigma=0.8; _r=int(_np.ceil(3*_sigma))
-                    _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
-                    _sm=_np.convolve(lv,_k,mode='same')
-                    ax.fill_between(xs,_sm,alpha=0.2,color=col); ax.plot(xs,_sm,color=col,linewidth=1.2)
-                ax.set_ylim(0,mx*1.1)
-                _ytv=[v for v in [1,10,100,1000,10000] if _np.log10(v+1)<=mx*1.05]
-                ax.set_yticks([_np.log10(v+1) for v in _ytv])
-                ax.set_yticklabels([str(v) for v in _ytv],fontsize=6)
-            if invert: ax.invert_yaxis()
-        _cov_panel(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+')
-        _cov_panel(fig.add_subplot(gs[-1]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',invert=True,show_xaxis=True)
-    buf=io.BytesIO()
-    fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
-    plt.close(fig); buf.seek(0)
-    _result='OK:'+base64.b64encode(buf.read()).decode()
-except Exception:
-    _result='ERR:'+traceback.format_exc()
-`;
-  }
-
-  // Simple mode
-  const pyFeatsSingle = feats.map(f=>{
-    const lbl=showLbls&&!(hideLong&&!labelFitsInFeature(f))?f.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'"):'';
-    const col=f.noncoding?NC_COLOR:f.color;
-    const s=Math.max(0,f.start-vs), ee=Math.min(seqLen,f.end-vs);
-    const si=f.strand==='+'?1:-1;
-    return `    GraphicFeature(start=${s},end=${ee},strand=${si},label=${lbl?`'${lbl}'`:'None'},color='${col}')`;
-  }).join(',\n');
-  return `
-import io,base64,traceback,matplotlib,matplotlib.gridspec as gridspec
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-_result=None
-try:
-    from dna_features_viewer import GraphicRecord,GraphicFeature
-    _f=[
-${pyFeatsSingle}
-    ]
-    _bg=${bg}; _fg=${fg}
-    _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
-    _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
-    _has_cov=_cov_style!='none' and len(_cov_plus)>0
-    rec=GraphicRecord(sequence_length=${seqLen},features=_f)
-    if _has_cov:
-        import numpy as _np
-        fig=plt.figure(figsize=(${width},3.8))
-        fig.patch.set_facecolor(_bg)
-        # Layout: cov+ | genes | cov-  mirrors TUI split-track layout
-        gs=gridspec.GridSpec(3,1,figure=fig,height_ratios=[1.4,2.25,1.4],hspace=0.05,
-            top=0.95,bottom=0.06,left=0.11,right=0.98)
-        import matplotlib.ticker as _tck
-        def _gfmt(x,p):
-            v=int(x)+${vs}
-            if v>=1000000: return f'{v//1000000}M'
-            if v>=1000: return f'{v//1000}k'
-            return str(v)
-        _bpfmt=_tck.FuncFormatter(_gfmt)
-        _xs=[(_cov_bin_off+i*_cov_bin_sz-${vs}) for i in range(len(_cov_plus))]
-        _lp=_np.log10(_np.array(_cov_plus,dtype=float)+1)
-        _lm=_np.log10(_np.array(_cov_minus,dtype=float)+1)
-        _mxp=max(float(_lp.max()) if len(_lp) else 1,0.01)
-        _mxm=max(float(_lm.max()) if len(_lm) else 1,0.01)
-        def _cov_ax(ax,xs,raw,col,label,invert=False,show_xaxis=False):
-            ax.set_facecolor(_bg)
-            for sp in ax.spines.values(): sp.set_color(_fg)
-            ax.tick_params(colors=_fg,labelsize=${fs-2})
-            ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=38,va='center',color=_fg)
-            ax.set_xlim(0,${seqLen})
-            if show_xaxis:
-                ax.xaxis.set_major_formatter(_bpfmt)
-                ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
-            else:
-                ax.set_xticklabels([])
-            if _cov_style=='reads':
-                from matplotlib.patches import Rectangle
-                from matplotlib.collections import PatchCollection
-                _rh,_rg,_mr=0.8,0.3,20
-                def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
-                _rects=[]
-                for _i,(_x,_c) in enumerate(zip(xs,raw)):
-                    if _c==0: continue
-                    _sd=_i*(67890 if invert else 12345)
-                    for _r in range(min(_mr,int(_c))):
-                        _sd=_lcg(_sd)
-                        _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
-                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
-                        _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
-                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
-                ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
-                _rd_ticks=[v for v in [5,10,20] if v<=_mr]
-                ax.set_yticks([v*(_rh+_rg) for v in _rd_ticks])
-                ax.set_yticklabels([str(v) for v in _rd_ticks],fontsize=6)
-            else:
-                lv=_np.log10(_np.array(raw,dtype=float)+1)
-                mx=max(float(lv.max()) if len(lv) else 1,0.01)
-                if _cov_style=='histogram':
-                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
-                else:
-                    _sigma=0.8; _r=int(_np.ceil(3*_sigma))
-                    _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
-                    _sm=_np.convolve(lv,_k,mode='same')
-                    ax.fill_between(xs,_sm,alpha=0.2,color=col); ax.plot(xs,_sm,color=col,linewidth=1.2)
-                ax.set_ylim(0,mx*1.1)
-                _ytv=[v for v in [1,10,100,1000,10000] if _np.log10(v+1)<=mx*1.05]
-                ax.set_yticks([_np.log10(v+1) for v in _ytv])
-                ax.set_yticklabels([str(v) for v in _ytv],fontsize=6)
-            if invert: ax.invert_yaxis()
-        _cov_ax(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+')
-        ax=fig.add_subplot(gs[1])
-        rec.plot(ax=ax,with_ruler=False,draw_line=True)
-        ax.set_facecolor(_bg)
-        for sp in ax.spines.values(): sp.set_color(_fg)
-        ax.tick_params(colors=_fg); ax.set_xticklabels([])
-        for t in ax.texts: t.set_fontsize(${fs})
-        _cov_ax(fig.add_subplot(gs[2]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',invert=True,show_xaxis=True)
-    else:
-        ax,_=rec.plot(figure_width=${width},with_ruler=${ruler?'True':'False'},draw_line=True)
-        fig=ax.get_figure()
-        fig.patch.set_facecolor(_bg)
-        ax.set_facecolor(_bg)
-        for sp in ax.spines.values(): sp.set_color(_fg)
-        ax.tick_params(colors=_fg)
-        for t in ax.texts: t.set_fontsize(${fs})
-    buf=io.BytesIO()
-    fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
-    plt.close(fig); buf.seek(0)
-    _result='OK:'+base64.b64encode(buf.read()).decode()
-except Exception:
-    _result='ERR:'+traceback.format_exc()
-`;
-}
-
-// ── Render ────────────────────────────────────────────────────────────────────
-async function triggerRender(forPng) {
-  if (!pyReady||!lastState||pyRendering) return;
-  pyRendering=true;
-  document.getElementById('btn-render').disabled=true;
-  setFigStatus(forPng?'rendering PNG\u2026':'rendering\u2026');
-  // Pass sequence window to Python for stop codon computation
-  const seq      = lastState.sequence || '';
-  const seqStart = lastState.seq_start || 0;
-  const relVS    = Math.max(0, localVS - seqStart);
-  const relVE    = Math.min(seq.length, localVE - seqStart);
-  const subseq   = relVS < relVE ? seq.slice(relVS, relVE) : '';
-  const subOff   = Math.max(0, seqStart - localVS);
-  pyodide.globals.set('_seq_sub', subseq);
-  pyodide.globals.set('_seq_sub_off', subOff);
-  try {
-    await pyodide.runPythonAsync(buildPyCode(localVS,localVE,forPng));
-    const result=pyodide.globals.get('_result');
-    if (!result||typeof result!=='string') {
-      setFig('<div class="fig-ph">Python returned null — check console.</div>');
-      setFigStatus('error');
-    } else if (result.startsWith('ERR:')) {
-      setFig(`<pre class="fig-err">${esc(result.slice(4))}</pre>`);
-      setFigStatus('Python error \u2014 see figure panel');
-    } else if (result.startsWith('OK:')) {
-      const b64=result.slice(3);
-      if (forPng) {
-        const blob=await (await fetch('data:image/png;base64,'+b64)).blob();
-        dlBlob(blob,'genetui_figure.png'); setFigStatus('PNG downloaded');
-      } else {
-        lastSvgData=atob(b64);
-        setFig(`<img src="data:image/svg+xml;base64,${b64}" style="max-width:100%">`);
-        document.getElementById('btn-svg').disabled=false;
-        document.getElementById('btn-png').disabled=false;
-        document.getElementById('btn-py').disabled=false;
-        setFigStatus('ready');
-      }
-    }
-  } catch(err) {
-    setFig(`<pre class="fig-err">${esc(String(err))}</pre>`);
-    setFigStatus('JS error');
-  }
-  document.getElementById('btn-render').disabled=false;
-  pyRendering=false;
-}
-
-function setFig(html) { document.getElementById('fig-output').innerHTML=html; }
-function dlBlob(blob,name) {
-  const url=URL.createObjectURL(blob);
-  Object.assign(document.createElement('a'),{href:url,download:name}).click();
-  URL.revokeObjectURL(url);
-}
-
-document.getElementById('btn-render').addEventListener('click',()=>triggerRender(false));
-document.getElementById('btn-svg').addEventListener('click',()=>{
-  if (lastSvgData) dlBlob(new Blob([lastSvgData],{type:'image/svg+xml'}),'genetui_figure.svg');
-});
-document.getElementById('btn-png').addEventListener('click',()=>triggerRender(true));
-document.getElementById('btn-py').addEventListener('click',()=>{
-  if (!lastState) return;
-  const vs=localVS, ve=localVE;
-  let code = buildPyCode(vs, ve, false);
-  if (!code) return;
-  // Replace Pyodide-specific output with standalone savefig
-  code = code
-    .replace(/import io,base64,traceback,matplotlib\n/,'import traceback,matplotlib\n')
-    .replace(/import io,base64,traceback\n/,'import traceback\n')
-    .replace(/_result=None\n/,'')
-    .replace(/try:\n/,'try:\n')
-    .replace(/\s*_result='OK:'\+base64\.b64encode\(buf\.read\(\)\)\.decode\(\)\n/,
-             "    plt.savefig('genetui_figure.png', dpi=600, bbox_inches='tight')\n    print('Saved genetui_figure.png')\n")
-    .replace(/\s*_result='ERR:'\+traceback\.format_exc\(\)\n/,
-             "    print(traceback.format_exc())\n")
-    .replace(/buf\s*=\s*io\.BytesIO\(\)\n\s*[^\n]*\.savefig\(buf[^\n]*\)\n\s*buf\.seek\(0\)\n/g, '');
-  const files = (lastState.input_files||[]).map(f=>`#   ${f}`).join('\n');
-  const filesLine = files ? `# Source files:\n${files}\n` : '';
-  const header = `# genetui figure — ${lastState.genome_name} ${vs}–${ve}\n# Generated by genetui (https://github.com/ZacharyArdern/genetui)\n${filesLine}# Run: pip install dna_features_viewer matplotlib && python genetui_figure.py\n\n`;
-  dlBlob(new Blob([header+code],{type:'text/plain'}),'genetui_figure.py');
-});
-
-// ── 3Dmol.js structure viewer ─────────────────────────────────────────────────
-let mol3dViewer=null, mol3dLoaded=false, mol3dStyle='plddt', lastPdbName='';
-let pendingPdb=null, pendingPdbName='';
-
-// Horizontal drag resize between struct-panel and fig-panel
-(function(){
-  const h=document.getElementById('struct-h-handle');
-  const sp=document.getElementById('struct-panel');
-  let drag=false, sx=0, sw=0;
-  h.addEventListener('mousedown', e=>{drag=true;sx=e.clientX;sw=sp.offsetWidth;e.preventDefault();});
-  document.addEventListener('mousemove', e=>{
-    if (!drag) return;
-    const row=document.getElementById('bottom-row');
-    const maxW=row.clientWidth-100;
-    sp.style.width=Math.max(150,Math.min(sw+e.clientX-sx,maxW))+'px';
-    if (mol3dViewer) mol3dViewer.resize();
-  });
-  document.addEventListener('mouseup', ()=>{drag=false;});
-})();
-
-function load3DmolLib(cb) {
-  if (window.$3Dmol) { cb(); return; }
-  const s=document.createElement('script');
-  s.src='https://3Dmol.org/build/3Dmol-min.js';
-  s.onload=cb;
-  s.onerror=()=>{ document.getElementById('struct-ph').textContent='3Dmol.js failed to load (offline?)'; };
-  document.head.appendChild(s);
-}
-
-function getBgColor() {
-  return document.getElementById('chk-white-bg').checked ? 0xffffff : 0x060a10;
-}
-// AlphaFold-like pLDDT gradient: orange(low)→yellow→cyan→blue(high)
-// 3Dmol built-in 'roygb' goes red→yellow→green→blue; we reverse it (min>max) to
-// get blue(high)→green→yellow→red(low), then shift hue by using rwb as a fallback.
-// Best approximation available without custom gradient API: use 'roygb' with min/max
-// swapped so high b-factor = blue end.
-function applyAfPlddt(opacity) {
-  mol3dViewer.setStyle({},{cartoon:{
-    colorscheme:{prop:'b', gradient:'roygb', min:0, max:100},
-    opacity
-  }});
-}
-function applyStyle() {
-  if (!mol3dViewer) return;
-  mol3dViewer.removeAllSurfaces();
-  mol3dViewer.setStyle({});
-  const plddt={colorscheme:{prop:'b',gradient:'roygb',min:0,max:100}};
-  switch(mol3dStyle) {
-    case 'plddt':
-      applyAfPlddt(0.72); break;
-    case 'spectrum':
-      mol3dViewer.setStyle({},{cartoon:{color:'spectrum', opacity:0.88}}); break;
-    case 'chain':
-      mol3dViewer.setStyle({},{cartoon:{colorscheme:'chainHetatm', opacity:0.88}}); break;
-    case 'secondary':
-      mol3dViewer.setStyle({},{cartoon:{colorscheme:'ssJmol', opacity:0.88}}); break;
-    case 'surface_plddt':
-      mol3dViewer.setStyle({},{cartoon:{color:'white', opacity:0.18}});
-      mol3dViewer.addSurface(window.$3Dmol.SurfaceType.MS,{...plddt, opacity:0.78}); break;
-    case 'surface_white':
-      mol3dViewer.setStyle({},{cartoon:{color:'white', opacity:0.18}});
-      mol3dViewer.addSurface(window.$3Dmol.SurfaceType.MS,{color:'white', opacity:0.72}); break;
-    case 'stick':
-      mol3dViewer.setStyle({},{stick:{colorscheme:'Jmol', radius:0.12}}); break;
-    case 'sphere':
-      mol3dViewer.setStyle({},{sphere:{colorscheme:'Jmol', radius:0.35}}); break;
-  }
-  const showBar = mol3dStyle==='plddt' || mol3dStyle==='surface_plddt';
-  document.getElementById('plddt-bar').classList.toggle('hidden',
-    !showBar || !document.getElementById('chk-plddt-bar').checked);
-  mol3dViewer.render();
-}
-
-async function downloadStructurePng(transparent) {
-  if (!mol3dViewer) return;
-  if (transparent) {
-    mol3dViewer.setBackgroundColor(0x000000, 0);
-    mol3dViewer.render();
-  }
-  const uri=mol3dViewer.pngURI();
-  const blob=await (await fetch(uri)).blob();
-  dlBlob(blob, (lastPdbName||'structure')+(transparent?'_transparent':'')+'.png');
-  if (transparent) {
-    mol3dViewer.setBackgroundColor(getBgColor());
-    mol3dViewer.render();
-  }
-}
-
-function initViewer(pdb, name) {
-  const el=document.getElementById('struct-view');
-  el.innerHTML='';
-  mol3dViewer=window.$3Dmol.createViewer(el,{backgroundColor:getBgColor(),antialias:true});
-  mol3dViewer.addModel(pdb,'pdb');
-  applyStyle();
-  mol3dViewer.zoomTo();
-  mol3dViewer.render();
-  lastPdbName=name;
-  document.getElementById('struct-name').textContent=name;
-  mol3dLoaded=true;
-}
-
-function updateStructure(pdb, name) {
-  const panel=document.getElementById('struct-panel');
-  panel.classList.add('visible');
-  document.getElementById('struct-h-handle').classList.add('visible');
-  if (window._panelCbs && window._panelCbs['struct-panel']) {
-    window._panelCbs['struct-panel'].disabled=false;
-    window._panelCbs['struct-panel'].checked=true;
-  }
-  if (!window.$3Dmol) {
-    pendingPdb=pdb; pendingPdbName=name;
-    load3DmolLib(()=>{ if (pendingPdb) { initViewer(pendingPdb,pendingPdbName); pendingPdb=null; } });
-    return;
-  }
-  if (mol3dLoaded && name===lastPdbName) return;
-  initViewer(pdb, name);
-}
-
-document.getElementById('struct-style-sel').addEventListener('change', function() {
-  mol3dStyle=this.value;
-  if (mol3dLoaded) applyStyle();
-});
-document.getElementById('chk-plddt-bar').addEventListener('change', ()=>{ if (mol3dLoaded) applyStyle(); });
-document.getElementById('chk-white-bg').addEventListener('change', ()=>{
-  if (!mol3dViewer) return;
-  mol3dViewer.setBackgroundColor(getBgColor());
-  document.getElementById('struct-view').style.background = document.getElementById('chk-white-bg').checked ? '#fff' : '#060a10';
-  mol3dViewer.render();
-});
-document.getElementById('btn-struct-png').addEventListener('click', ()=>downloadStructurePng(false));
-document.getElementById('btn-struct-png-t').addEventListener('click', ()=>downloadStructurePng(true));
-
-document.getElementById('btn-struct-dl').addEventListener('click', ()=>{
-  if (!lastState||!lastState.protein_pdb) return;
-  dlBlob(new Blob([lastState.protein_pdb],{type:'chemical/x-pdb'}),lastPdbName+'.pdb');
-});
-</script>
+<script src="/static/genome_track.js"></script>
+<script src="/static/coverage.js"></script>
+<script src="/static/navigation.js"></script>
+<script src="/static/panels.js"></script>
+<script src="/static/gene_plot.js"></script>
+<script src="/static/structure.js"></script>
+<script src="/static/websocket.js"></script>
+<script src="/static/gene_info.js"></script>
+<script src="/static/msa_panel.js"></script>
+<script src="/static/circular_plot.js"></script>
 </body>
 </html>"#####;

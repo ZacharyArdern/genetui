@@ -120,6 +120,7 @@ pub struct App {
     /// When true, the fold command is jwohlwend/minifold predict.py, which writes PDBs into
     /// a nested minifold_results_<basename>/ subdirectory instead of flat in out_dir.
     pub fold_predict_py: bool,
+    pub basic_mode: bool,
 }
 
 impl App {
@@ -185,6 +186,7 @@ impl App {
             needs_clear: false,
             source_files: Vec::new(),
             fold_predict_py: false,
+            basic_mode: false,
         }
     }
 

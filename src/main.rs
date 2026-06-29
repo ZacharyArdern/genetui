@@ -50,6 +50,10 @@ struct Cli {
     /// Path to FAMSA binary (optional; falls back to PATH then ~/Science/Programs/FAMSA/famsa)
     #[arg(long)]
     famsa: Option<String>,
+
+    /// Basic colour mode for standard terminals (no truecolor required)
+    #[arg(long)]
+    basic: bool,
 }
 
 
@@ -202,6 +206,10 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);
     app.fold_predict_py = use_predict_py && app.on_click_cmd.is_some();
+    app.basic_mode = cli.basic;
+    if cli.basic {
+        app.display_opts.show_legend = false;
+    }
     app.source_files = std::iter::once(Some(gff_path.clone()))
         .chain([fasta_path.clone(), bam_path.clone()])
         .filter_map(|p| p)
@@ -304,6 +312,7 @@ async fn run_loop(
         }
         if msa_completed {
             terminal.clear()?;
+            push_browser_state(app, web);
         }
 
         // Apply viewport commands from browser
@@ -311,6 +320,84 @@ async fn run_loop(
             if ve > vs && ve <= app.genome_size {
                 app.view_start = vs;
                 app.view_end   = ve;
+            }
+        }
+
+        // Apply fold commands from browser (find gene, open protein panel, start fold)
+        if let Some(gene_name) = web.take_fold_cmd() {
+            let feat_opt = app.active_features().iter().find(|f| {
+                f.name == gene_name || f.locus_tag == gene_name
+            }).cloned();
+            if let Some(feat) = feat_opt {
+                let seq_source: Option<String> = if app.active_genome > 0 {
+                    app.plasmids.get(app.active_genome - 1).map(|p| p.sequence.clone())
+                } else {
+                    app.genome_seq.clone()
+                };
+                if let Some(seq) = seq_source {
+                    let start_idx = (feat.start as usize).saturating_sub(1);
+                    let end_idx   = (feat.end as usize).min(seq.len());
+                    let raw = &seq[start_idx..end_idx];
+                    let nt_seq = if feat.strand == '-' {
+                        crate::core::reverse_complement_str(raw).to_uppercase()
+                    } else {
+                        raw.to_uppercase()
+                    };
+                    let aa_seq = translate(&nt_seq);
+                    app.open_protein_panel(feat.name.clone(), nt_seq, aa_seq);
+                    start_fold(app, &mut fold_rx).await;
+                } else {
+                    app.set_status(format!("{}: no FASTA loaded", gene_name));
+                }
+            } else {
+                app.set_status(format!("fold: gene '{}' not found", gene_name));
+            }
+        }
+
+        // Apply switch_genome commands from browser
+        if let Some((genome_idx, vs, ve)) = web.take_switch_cmd() {
+            app.switch_genome(genome_idx);
+            let gsize = app.active_genome_size();
+            if vs < ve && ve <= gsize {
+                if app.active_genome == 0 {
+                    app.view_start = vs;
+                    app.view_end   = ve;
+                } else if let Some(p) = app.plasmids.get_mut(app.active_genome.saturating_sub(1)) {
+                    p.view_start = vs;
+                    p.view_end   = ve;
+                }
+            }
+            push_browser_state(app, web);
+        }
+
+        // Apply MSA commands from browser (find gene, open protein panel, start MSA)
+        if let Some(gene_name) = web.take_msa_cmd() {
+            let feat_opt = app.active_features().iter().find(|f| {
+                f.name == gene_name || f.locus_tag == gene_name
+            }).cloned();
+            if let Some(feat) = feat_opt {
+                let seq_source: Option<String> = if app.active_genome > 0 {
+                    app.plasmids.get(app.active_genome - 1).map(|p| p.sequence.clone())
+                } else {
+                    app.genome_seq.clone()
+                };
+                if let Some(seq) = seq_source {
+                    let start_idx = (feat.start as usize).saturating_sub(1);
+                    let end_idx   = (feat.end as usize).min(seq.len());
+                    let raw = &seq[start_idx..end_idx];
+                    let nt_seq = if feat.strand == '-' {
+                        crate::core::reverse_complement_str(raw).to_uppercase()
+                    } else {
+                        raw.to_uppercase()
+                    };
+                    let aa_seq = translate(&nt_seq);
+                    app.open_protein_panel(feat.name.clone(), nt_seq, aa_seq);
+                    start_msa_search(app, &mut msa_rx).await;
+                } else {
+                    app.set_status(format!("{}: no FASTA loaded", gene_name));
+                }
+            } else {
+                app.set_status(format!("msa: gene '{}' not found", gene_name));
             }
         }
 
@@ -1016,8 +1103,9 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
     const MINUS_COLORS: &[(u8,u8,u8)] = &[
         (240,148,50),(225,118,70),(245,175,45),(230,132,80),(238,160,55),(220,105,75),
     ];
-    let features = app.active_features().iter()
-        .map(|f| {
+
+    let feat_to_browser = |feats: &[core::Feature]| -> Vec<server::BrowserFeature> {
+        feats.iter().map(|f| {
             let (r,g,b) = if f.strand == '+' {
                 PLUS_COLORS[f.color_idx % PLUS_COLORS.len()]
             } else {
@@ -1025,14 +1113,32 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
             };
             server::BrowserFeature {
                 name:      if f.name.is_empty() { f.locus_tag.clone() } else { f.name.clone() },
+                locus_tag: f.locus_tag.clone(),
                 start:     f.start,
                 end:       f.end,
                 strand:    f.strand,
                 color:     format!("#{:02x}{:02x}{:02x}", r, g, b),
                 noncoding: f.noncoding,
+                is_orf:    f.is_orf,
             }
-        })
-        .collect();
+        }).collect()
+    };
+
+    let downsample_skew = |raw: &[f64]| -> Vec<f32> {
+        if raw.is_empty() { return vec![]; }
+        let target = 400.min(raw.len());
+        (0..target).map(|i| raw[i * raw.len() / target] as f32).collect()
+    };
+
+    let main_features = feat_to_browser(&app.features);
+    let main_gc_skew  = downsample_skew(&app.gc_skew);
+
+    let plasmid_names:    Vec<String>              = app.plasmids.iter().map(|p| p.name.clone()).collect();
+    let plasmid_sizes:    Vec<u64>                 = app.plasmids.iter().map(|p| p.genome_size).collect();
+    let plasmid_features: Vec<Vec<server::BrowserFeature>> = app.plasmids.iter().map(|p| feat_to_browser(&p.features)).collect();
+    let plasmid_gc_skew:  Vec<Vec<f32>>           = app.plasmids.iter().map(|p| downsample_skew(&p.gc_skew)).collect();
+
+    let features = feat_to_browser(app.active_features());
 
     let active_seq: Option<&str> = if app.active_genome == 0 {
         app.genome_seq.as_deref()
@@ -1088,7 +1194,32 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         coverage_minus:     cov_minus,
         coverage_bin_size:  cov_bin_sz,
         coverage_bin_start: cov_bin_start,
+        gc_skew: vec![],  // redundant with main_gc_skew/plasmid_gc_skew; kept for compatibility
         input_files: app.source_files.clone(),
+        msa_gene: app.msa.as_ref()
+            .filter(|m| !m.loading && m.error.is_none() && !m.sequences.is_empty())
+            .map(|m| m.gene_name.clone())
+            .unwrap_or_default(),
+        msa_sequences: app.msa.as_ref()
+            .filter(|m| !m.loading && m.error.is_none())
+            .map(|m| m.sequences.iter().map(|(id, seq)| [id.clone(), seq.clone()]).collect())
+            .unwrap_or_default(),
+        status_msg: if app.protein.as_ref().map(|p| p.folding).unwrap_or(false) {
+            "Folding protein\u{2026}".into()
+        } else if app.msa.as_ref().map(|m| m.loading).unwrap_or(false) {
+            "Building MSA\u{2026}".into()
+        } else {
+            String::new()
+        },
+        active_genome: app.active_genome,
+        main_name:     app.genome_name.clone(),
+        main_size:     app.genome_size,
+        main_features,
+        main_gc_skew,
+        plasmid_names,
+        plasmid_sizes,
+        plasmid_features,
+        plasmid_gc_skew,
     });
 }
 
