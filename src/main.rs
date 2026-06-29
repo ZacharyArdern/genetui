@@ -201,7 +201,24 @@ async fn main() -> Result<()> {
         None
     };
 
-    let dmnd_db   = cli.dmnd.clone();
+    let dmnd_db = match cli.dmnd.clone() {
+        Some(path) if path.ends_with(".fasta") || path.ends_with(".fasta.gz") || path.ends_with(".fa") || path.ends_with(".fa.gz") => {
+            let db_path = format!("{}.dmnd", path);
+            if !std::path::Path::new(&db_path).exists() {
+                eprintln!("Building DIAMOND database from {} → {}", path, db_path);
+                let status = std::process::Command::new("diamond")
+                    .args(["makedb", "--in", &path, "--db", &db_path, "--quiet"])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => eprintln!("DIAMOND db built: {}", db_path),
+                    Ok(s) => eprintln!("diamond makedb failed (exit {})", s),
+                    Err(e) => eprintln!("Failed to run diamond: {}", e),
+                }
+            }
+            Some(db_path)
+        }
+        other => other,
+    };
     let famsa_bin = find_famsa(cli.famsa.clone());
 
     let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);

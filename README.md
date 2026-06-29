@@ -13,6 +13,7 @@ A fast terminal-based genome research tool written in Rust, with a live-synced b
 - **Circular genome maps** — sliding-window gene-density heatmaps per strand, GC skew, optional plasmid maps; clickable to navigate, draggable "you are here" arc
 - **Custom gene plot** — Pyodide + dna_features_viewer renders publication-quality figures directly in the browser, no server required
 - **Protein structure viewer** — fold any selected gene with `f` (minifold); 3Dmol.js panel appears automatically, coloured by pLDDT
+- **Multiple sequence alignment** — DIAMOND homolog search against any protein database, aligned with FAMSA2; visualised in the TUI (braille/block rendering from seqtui) or in the browser (biotite)
 - **Six-frame translation** — correct frame assignment for both strands, stop codons as tick marks, matching between TUI and browser views
 
 ## Usage
@@ -25,6 +26,10 @@ Options:
   --minifold_mlx <dir>  Path to minifold_mlx for local folding
   --bam <file>          BAM/SAM/CRAM for coverage track
   --web                 Open browser companion (default port 7890)
+  --dmnd <file>         DIAMOND protein database (.dmnd) for MSA homolog search.
+                        If a FASTA file is given instead (.fasta / .fasta.gz / .fa / .fa.gz),
+                        a DIAMOND database is built automatically at <file>.dmnd on first run.
+                        Example: UniProt/SwissProt — https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
 ```
 
 ### Key bindings
