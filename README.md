@@ -4,7 +4,7 @@
   <img src="genetui.png" alt="genetui logo" width="180"/>
 </p>
 
-A fast terminal-based genome browser written in Rust, with a live browser extension for publication-ready figures and higher quality visualisations.
+A fast terminal-based genome research tool written in Rust, with a live-synced browser extension for publication-ready figures and higher quality visualisations.
 
 ## Features
 
