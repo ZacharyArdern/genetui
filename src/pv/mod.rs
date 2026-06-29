@@ -1,3 +1,6 @@
+// The modules in this directory (camera, framebuffer, ribbon, braille, etc.) are
+// derived from ProteinView by Tristan Farmer: https://github.com/001TMF/ProteinView
+pub mod braille;
 pub mod camera;
 pub mod color;
 pub mod framebuffer;

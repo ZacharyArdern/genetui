@@ -25,13 +25,20 @@ jobs:
 
       - name: Install htslib (macOS)
         if: runner.os == 'macOS'
-        run: brew install htslib
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install htslib pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix htslib)/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Install htslib (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libhtslib-dev pkg-config
+          sudo apt-get install -y \
+            libhtslib-dev pkg-config \
+            libbz2-dev liblzma-dev \
+            libcurl4-openssl-dev libssl-dev \
+            zlib1g-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,7 +63,11 @@ jobs:
           BINARY=target/${{ matrix.target }}/release/genetui
           strip "$BINARY" || true
           tar czf ${{ matrix.artifact }}.tar.gz -C "$(dirname $BINARY)" genetui
-          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

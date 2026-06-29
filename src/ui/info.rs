@@ -13,10 +13,11 @@ pub(super) fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
     let dim  = if app.basic_mode { Color::DarkGray } else { Color::Rgb(80, 80, 110) };
     let bold = if app.basic_mode { Color::White } else { Color::Rgb(205, 214, 244) };
     let hi   = if app.basic_mode { Color::White } else { Color::Rgb(160, 200, 240) };
-    let shortcuts = Span::styled(
-        "/:search  d:menu",
-        Style::default().fg(dim).bg(bg),
-    );
+    let shortcuts = Line::from(vec![
+        Span::styled(" /:search  ", Style::default().fg(Color::White).bg(bg)),
+        Span::styled("d:menu  ", Style::default().fg(Color::White).bg(bg)),
+        Span::styled("w:browser app", Style::default().fg(Color::White).bg(bg)),
+    ]);
 
     let lines = if let Some(idx) = app.hovered {
         let feat = &app.active_features()[idx];
@@ -73,7 +74,7 @@ pub(super) fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
                 " colour bars: gene density per 10 kb (+ strand, − strand) and GC skew",
                 Style::default().fg(hi).bg(bg),
             )),
-            Line::from(shortcuts),
+            shortcuts.clone(),
         ]
     } else {
         let hint = if app.active_genome > 0 {
@@ -89,7 +90,7 @@ pub(super) fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
         };
         vec![
             Line::from(Span::styled(hint, Style::default().fg(dim).bg(bg))),
-            Line::from(shortcuts),
+            shortcuts.clone(),
         ]
     };
 

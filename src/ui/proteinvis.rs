@@ -85,32 +85,37 @@ pub(super) fn draw_protein_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    if app.basic_mode {
-        let y_off = inner.height.saturating_sub(1) / 2;
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  open browser app (press w) to see protein",
-                Style::default().fg(Color::DarkGray).bg(Color::Black),
-            ))).style(Style::default().bg(Color::Black)),
-            Rect { y: inner.y + y_off, height: inner.height.saturating_sub(y_off), ..inner },
-        );
-        return;
-    }
-
     let n_res = panel.atoms.len();
     let avg_plddt = if n_res > 0 {
         panel.atoms.iter().map(|a| a.plddt as f64).sum::<f64>() / n_res as f64
     } else { 0.0 };
     let bg_rgb = Color::Rgb(18, 18, 30);
-    f.render_widget(Paragraph::new("").style(Style::default().bg(bg_rgb)), inner);
-    if let Some(ref img) = panel.img_cache {
-        let render_area = if inner.height > 1 {
-            Rect { height: inner.height - 1, ..inner }
-        } else { inner };
-        if let Some(widget) = crate::pv::kitty_png::KittyPngImage::new(img, render_area) {
-            f.render_widget(widget, render_area);
+
+    let render_area = if inner.height > 1 {
+        Rect { height: inner.height - 1, ..inner }
+    } else {
+        inner
+    };
+
+    if app.kitty_native {
+        // Full Kitty terminal: render high-res image via unicode placeholder widget.
+        f.render_widget(Paragraph::new("").style(Style::default().bg(bg_rgb)), inner);
+        if let Some(ref img) = panel.img_cache {
+            if let Some(widget) = crate::pv::kitty_png::KittyPngImage::new(img, render_area) {
+                f.render_widget(widget, render_area);
+            }
         }
+    } else {
+        // Braille rendering: works in any terminal including VSCode.
+        f.render_widget(Paragraph::new("").style(Style::default().bg(Color::Black)), inner);
+        let braille = crate::pv::braille::render_braille(
+            &panel.atoms,
+            &panel.camera,
+            render_area,
+        );
+        f.render_widget(braille.style(Style::default().bg(Color::Black)), render_area);
     }
+
     if inner.height > 1 {
         let status = format!("  {} residues   avg pLDDT {:.0}   drag to rotate", n_res, avg_plddt);
         let st_area = Rect { y: inner.y + inner.height - 1, height: 1, ..inner };

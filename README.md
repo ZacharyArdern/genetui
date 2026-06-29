@@ -87,3 +87,4 @@ MIT — see [LICENSE](LICENSE).
 | Local protein folding | [minifold-mlx](https://github.com/ZacharyArdern/MiniFold-MLX/) | Lightweight folding based on [MiniFold](https://github.com/EricAlcaide/MiniFold) by Jeremy Wohlwend & Eric Alcaide; MLX port for Apple Silicon |
 | PNG rendering | [image](https://github.com/image-rs/image) + [base64](https://github.com/marshallpierce/rust-base64) | Framebuffer→PNG conversion for Kitty terminal graphics protocol |
 | Parallel computation | [rayon](https://github.com/rayon-rs/rayon) | Parallel sliding-window density and GC-skew calculations |
+| Protein TUI rendering | [ProteinView](https://github.com/001TMF/ProteinView) | `src/pv/` module (camera, framebuffer, ribbon, braille rendering) is derived from ProteinView by Tristan Farmer |

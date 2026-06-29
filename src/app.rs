@@ -121,6 +121,15 @@ pub struct App {
     /// a nested minifold_results_<basename>/ subdirectory instead of flat in out_dir.
     pub fold_predict_py: bool,
     pub basic_mode: bool,
+    /// True when running in a real Kitty terminal (KITTY_WINDOW_ID set).
+    /// False in VSCode/xterm.js — triggers post-draw direct Kitty placement.
+    pub kitty_native: bool,
+    /// Raw bytes to write directly to stdout after terminal.draw().
+    /// Used by the non-native Kitty path to place the protein image after ratatui.
+    /// Rebuilt only when the image changes to avoid re-encoding every 100 ms.
+    pub pending_kitty: Option<Vec<u8>>,
+    /// Set to true when img_cache changes so pending_kitty gets rebuilt.
+    pub kitty_image_dirty: bool,
 }
 
 impl App {
@@ -187,6 +196,11 @@ impl App {
             source_files: Vec::new(),
             fold_predict_py: false,
             basic_mode: false,
+            kitty_native: std::env::var("KITTY_WINDOW_ID").is_ok()
+                || std::env::var("TERM").map(|t| t == "xterm-kitty").unwrap_or(false)
+                || std::env::var("TERM_PROGRAM").map(|t| t == "ghostty").unwrap_or(false),
+            pending_kitty: None,
+            kitty_image_dirty: false,
         }
     }
 

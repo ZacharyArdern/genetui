@@ -401,7 +401,7 @@ async fn run_loop(
             }
         }
 
-        // Render protein image before draw so the frame is never blank
+        // Render protein image before draw so the frame is never blank.
         if let Some(ref panel) = app.protein {
             if !panel.atoms.is_empty() && panel.img_cache.is_none() {
                 let atoms_snap = panel.atoms.clone();
@@ -415,6 +415,7 @@ async fn run_loop(
                         if let Some(ref mut panel_mut) = app.protein {
                             panel_mut.img_cache = Some(img);
                         }
+                        app.kitty_image_dirty = true;
                     }
                 }
             }
@@ -569,7 +570,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.zoom *= 1.35;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Char('-')
@@ -577,7 +578,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.zoom /= 1.35;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Left | KeyCode::Char('h')
@@ -586,7 +587,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.rot_y -= 0.15;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Right | KeyCode::Char('l')
@@ -595,7 +596,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.rot_y += 0.15;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Up | KeyCode::Char('k')
@@ -604,7 +605,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.rot_x += 0.15;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Down | KeyCode::Char('j')
@@ -613,7 +614,7 @@ async fn run_loop(
                             {
                                 if let Some(ref mut p) = app.protein {
                                     p.camera.rot_x -= 0.15;
-                                    p.img_cache = None;
+                                    p.img_cache = None; app.kitty_image_dirty = true;
                                 }
                             }
                             KeyCode::Left | KeyCode::Char('h') => {

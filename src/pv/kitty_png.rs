@@ -1,28 +1,17 @@
 //! Compressed Kitty graphics protocol transmitter using raw RGBA + zlib.
 //!
-//! ratatui-image sends Kitty images as raw RGBA32 base64-encoded (`f=32`),
-//! which is ~1.3MB per frame for a 640x384 render.  This module compresses
-//! the raw RGBA pixel data with zlib (level 1 / fastest) and sends it via
-//! the Kitty graphics protocol with `f=32,o=z`.  This avoids PNG's
-//! filtering, CRC checksums, and chunk framing overhead while still
-//! achieving good compression on protein renders (mostly black/transparent
-//! background).
+//! Two rendering paths are selected at runtime:
 //!
-//! Note: the file is still named `kitty_png.rs` for historical reasons and
-//! to minimize import churn.  The actual encoding is raw RGBA + zlib, not PNG.
+//! **Unicode-placeholder path** (real Kitty terminal, `KITTY_WINDOW_ID` set):
+//! Uses `U=1` + `\u{10EEEE}` diacritics so ratatui's diff engine clears old
+//! content and there is no ghost/smear effect when rotating.
 //!
-//! Unlike the original implementation which dumped the escape sequence into
-//! cell (0,0) and skipped everything else, this version uses Kitty's
-//! **unicode placeholder** mechanism (`U=1` + `\u{10EEEE}` with diacritics).
-//! Every cell in the render area is written to, so ratatui's diff engine
-//! properly clears old content — fixing both the braille-bleed-through and
-//! the ghost/smear effect when rotating.
-//!
-//! We use a **single fixed image ID** and transmit with `a=T,U=1` every
-//! frame.  Kitty atomically replaces the old image data when it receives a
-//! new transmission for the same ID, so there is no visible gap between
-//! frames — eliminating flicker entirely.  No delete commands are needed
-//! during normal rendering; cleanup is done only when leaving FullHD mode.
+//! **Direct-placement path** (xterm.js / VSCode and other terminals with basic
+//! Kitty graphics support but no unicode placeholder support):
+//! Transmits with `a=T` (no `U=1`) and `c=`/`r=` for scaling, placing the
+//! image at the cursor position via save/restore.  Other cells are set to
+//! skip so the image is not overwritten.  The `\u{10EEEE}` placeholder chars
+//! that caused empty-box rendering in VSCode are avoided entirely.
 
 use std::fmt::Write;
 use std::io::Write as IoWrite;
@@ -40,16 +29,20 @@ use ratatui::widgets::Widget;
 /// image data — no flicker, no delete-before-draw gap.
 const IMAGE_ID: u32 = 1;
 
-/// A ratatui `Widget` that renders a `DynamicImage` via the Kitty graphics
-/// protocol using raw RGBA data with zlib compression (`f=32,o=z`) and
-/// unicode placeholders.
-///
-/// Named `KittyPngImage` for historical reasons; the actual encoding is
-/// zlib-compressed raw RGBA, not PNG.
+/// Returns true when running inside a real Kitty terminal that supports the
+/// unicode placeholder mechanism.  VSCode/xterm.js and other basic Kitty
+/// implementations do not set `KITTY_WINDOW_ID`.
+fn is_kitty_native() -> bool {
+    std::env::var("KITTY_WINDOW_ID").is_ok()
+        || std::env::var("TERM").map(|t| t == "xterm-kitty").unwrap_or(false)
+}
+
 pub struct KittyPngImage {
     transmit: String,
     unique_id: u32,
     area: Rect,
+    /// True → unicode placeholder render; false → direct-placement render.
+    use_placeholders: bool,
 }
 
 impl KittyPngImage {
@@ -59,6 +52,51 @@ impl KittyPngImage {
     /// prevent stale images from lingering in the terminal's memory.
     /// Returns the escape sequence as a `String` that must be written to
     /// the terminal (e.g. via stdout).
+    /// Build an iTerm2 inline-image sequence for post-draw placement in VSCode.
+    ///
+    /// VSCode's xterm.js has supported the iTerm2 OSC 1337 inline image protocol
+    /// since 2021, predating and being more complete than its Kitty graphics support.
+    /// The image is PNG-encoded (browser-native decoding), positioned with DEC
+    /// save/restore cursor, and sized in terminal cells via `width=` / `height=`.
+    ///
+    /// Write the returned bytes directly to stdout after `terminal.draw()` so
+    /// ratatui's frame cannot overwrite the image layer.
+    /// Build post-draw image sequences for non-Kitty terminals.
+    /// Returns `(iterm2_bel, iterm2_st, minimal)` — three variants to try in order.
+    pub fn build_direct_seq(img: &DynamicImage, area: Rect) -> Option<Vec<u8>> {
+        // Downscale to 300×200 to stay well under xterm.js's OSC buffer limit.
+        let small = img.resize(300, 200, image::imageops::FilterType::Triangle);
+        let mut png_bytes: Vec<u8> = Vec::new();
+        small.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).ok()?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+        let cols = area.width;
+        let rows = area.height;
+        let row1 = area.top() + 1;
+        let col1 = area.left() + 1;
+
+        // Try three variants back-to-back so at least one hits if supported.
+        // Variant A: full params + BEL terminator
+        // Variant B: full params + ST terminator
+        // Variant C: minimal (no params) — just inline=1 + data, at current cursor
+        let mut seq = String::with_capacity(b64.len() * 3 + 256);
+
+        // A — positioned, BEL
+        write!(seq, "\x1b7\x1b[{row1};{col1}H").unwrap();
+        write!(seq, "\x1b]1337;File=inline=1;width={cols};height={rows}:{b64}\x07").unwrap();
+        write!(seq, "\x1b8").unwrap();
+
+        // B — positioned, ST
+        write!(seq, "\x1b7\x1b[{row1};{col1}H").unwrap();
+        write!(seq, "\x1b]1337;File=inline=1;width={cols};height={rows}:{b64}\x1b\\").unwrap();
+        write!(seq, "\x1b8").unwrap();
+
+        // C — minimal, no positioning (wherever cursor is)
+        write!(seq, "\x1b]1337;File=inline=1:{b64}\x07").unwrap();
+
+        Some(seq.into_bytes())
+    }
+
     pub fn cleanup_escape() -> String {
         format!("\x1b_Gq=2,a=d,d=I,i={IMAGE_ID}\x1b\\")
     }
@@ -76,138 +114,138 @@ impl KittyPngImage {
     /// No delete commands are emitted during normal rendering.
     pub fn new(img: &DynamicImage, area: Rect) -> Option<Self> {
         let (w, h) = (img.width(), img.height());
+        let use_placeholders = is_kitty_native();
 
-        // Get raw RGBA bytes from the image.
         let rgba = img.to_rgba8();
         let raw_bytes = rgba.as_raw();
 
-        // Compress with zlib level 1 (fastest).  Returns None on failure so
-        // the caller can fall back to braille instead of crashing the TUI.
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        if encoder.write_all(raw_bytes).is_err() {
-            return None;
-        }
-        let compressed = match encoder.finish() {
-            Ok(bytes) => bytes,
-            Err(_) => return None,
-        };
+        if encoder.write_all(raw_bytes).is_err() { return None; }
+        let compressed = match encoder.finish() { Ok(b) => b, Err(_) => return None };
 
-        // Base64.
         let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
 
-        // Build Kitty escape, chunked to <=4096 base64 chars.
-        // U=1 enables virtual placement via unicode placeholders.
         const CHARS_PER_CHUNK: usize = 4096;
         let chunks: Vec<&str> = b64
             .as_bytes()
             .chunks(CHARS_PER_CHUNK)
-            .map(|c| std::str::from_utf8(c).expect("base64 output is always valid UTF-8"))
+            .map(|c| std::str::from_utf8(c).expect("base64 is always valid UTF-8"))
             .collect();
         let chunk_count = chunks.len();
 
-        let mut transmit = String::with_capacity(b64.len() + chunk_count * 80);
-
-        // Include `c=` (columns) and `r=` (rows) parameters so Kitty
-        // scales the image to fill the full placeholder grid.  Without
-        // these, Kitty maps each placeholder cell to font_width x
-        // font_height pixels of the source image — if the image is
-        // smaller than cols*font_w x rows*font_h (e.g. during half-res
-        // interaction rendering), the image would appear in the top-left
-        // corner instead of filling the viewport.
         let cols = area.width;
         let rows = area.height;
 
+        let mut transmit = String::with_capacity(b64.len() + chunk_count * 80);
         for (i, chunk) in chunks.iter().enumerate() {
             write!(transmit, "\x1b_Gq=2,").unwrap();
             if i == 0 {
-                // a=T = transmit+display, f=32 = raw RGBA, o=z = zlib compression
-                // t=d = direct (inline), U=1 = use unicode placeholders
-                // c/r = columns/rows the image should span (forces scaling)
-                // Reusing IMAGE_ID causes Kitty to atomically replace the
-                // previous image — no delete needed, no flicker.
-                write!(
-                    transmit,
-                    "i={IMAGE_ID},a=T,U=1,f=32,o=z,t=d,s={w},v={h},c={cols},r={rows},"
-                )
-                .unwrap();
+                if use_placeholders {
+                    // Full Kitty: unicode placeholder mode — each cell carries
+                    // row/col diacritics; Kitty assembles the image from them.
+                    write!(transmit,
+                        "i={IMAGE_ID},a=T,U=1,f=32,o=z,t=d,s={w},v={h},c={cols},r={rows},"
+                    ).unwrap();
+                } else {
+                    // Basic Kitty (VSCode/xterm.js): direct placement at cursor.
+                    // c=/r= tell the terminal to scale the image to that many cells.
+                    // No U=1 → no unicode placeholder characters in the buffer.
+                    write!(transmit,
+                        "i={IMAGE_ID},a=T,f=32,o=z,t=d,s={w},v={h},c={cols},r={rows},"
+                    ).unwrap();
+                }
             }
             let more = u8::from(chunk_count > (i + 1));
             write!(transmit, "m={more};{chunk}\x1b\\").unwrap();
         }
 
-        Some(Self {
-            transmit,
-            unique_id: IMAGE_ID,
-            area,
-        })
+        Some(Self { transmit, unique_id: IMAGE_ID, area, use_placeholders })
     }
 }
 
 impl Widget for KittyPngImage {
-    fn render(mut self, area: Rect, buf: &mut Buffer) {
-        // Encode the image ID as an RGB foreground color — Kitty uses this
-        // to associate placeholder characters with the transmitted image.
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if self.use_placeholders {
+            self.render_placeholders(area, buf);
+        } else {
+            self.render_direct(area, buf);
+        }
+    }
+}
+
+impl KittyPngImage {
+    /// Unicode-placeholder render (real Kitty terminal).
+    /// Every cell carries row/column diacritics so ratatui's diff engine
+    /// properly clears stale content between frames.
+    fn render_placeholders(mut self, area: Rect, buf: &mut Buffer) {
         let [id_extra, id_r, id_g, id_b] = self.unique_id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
-
-        // Cap to 297 rows — the maximum the DIACRITICS table can address.
-        // 297 rows covers terminals up to ~4700px tall at 16px font, which is plenty.
         let full_height = area.height.min(self.area.height).min(297);
-        let full_width = area.width.min(self.area.width);
+        let full_width  = area.width.min(self.area.width);
 
         for y in 0..full_height {
-            // The transmit sequence is only written into the first row's
-            // first cell; subsequent rows just get placeholders.
             let mut symbol = if y == 0 {
                 std::mem::take(&mut self.transmit)
             } else {
                 String::new()
             };
-
             let width_usize = usize::from(full_width);
-
-            // Reserve space for: save cursor + fg color + placeholder chars
-            // + diacritics + restore cursor + repositioning.
             symbol.reserve(id_color.len() + (width_usize * 16) + 32);
 
-            // Save cursor position, set fg color to encode image ID, then
-            // emit the first placeholder character with full diacritics
-            // (row, column=0, extra id byte).
             write!(
                 symbol,
                 "\x1b[s{id_color}\u{10EEEE}{}{}{}",
-                diacritic(y),
-                diacritic(0),
-                diacritic(u16::from(id_extra)),
-            )
-            .unwrap();
+                diacritic(y), diacritic(0), diacritic(u16::from(id_extra)),
+            ).unwrap();
+            symbol.extend(std::iter::repeat_n('\u{10EEEE}', width_usize.saturating_sub(1)));
 
-            // Emit placeholder characters for columns 1..width.
-            // These inherit the row/id diacritics from the first character;
-            // Kitty uses positional inheritance so just `\u{10EEEE}` suffices.
-            symbol.extend(std::iter::repeat_n(
-                '\u{10EEEE}',
-                width_usize.saturating_sub(1),
-            ));
-
-            // Restore saved cursor position (including color), then move
-            // the cursor to the bottom-right of the area so ratatui's
-            // cursor tracking stays correct.
             let right = area.width.saturating_sub(1);
-            let down = area.height.saturating_sub(1);
+            let down  = area.height.saturating_sub(1);
             write!(symbol, "\x1b[u\x1b[{right}C\x1b[{down}B").unwrap();
 
-            // Write the assembled symbol into the first cell of this row.
             if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
                 cell.set_symbol(&symbol);
             }
-
-            // Mark remaining cells in this row as skip — the first cell's
-            // escape sequence already wrote placeholder characters that
-            // cover these positions.
             for x in 1..full_width {
                 if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
                     cell.set_skip(true);
+                }
+            }
+        }
+    }
+
+    /// Direct-placement render (VSCode/xterm.js and other basic Kitty terminals).
+    ///
+    /// The Kitty escape sequence (without `U=1`) is placed into the top-left
+    /// cell wrapped in cursor save/restore.  All other cells are filled with
+    /// dark-background spaces rather than skipped — `set_skip` leaves cells
+    /// unwritten so the terminal shows raw white on first render.  In xterm.js,
+    /// Kitty images are composited on a separate canvas layer above the text
+    /// layer, so these spaces appear behind the image.
+    fn render_direct(mut self, area: Rect, buf: &mut Buffer) {
+        use ratatui::style::{Color, Style};
+
+        let right = area.width.saturating_sub(1);
+        let down  = area.height.saturating_sub(1);
+
+        let mut symbol = String::new();
+        write!(symbol, "\x1b[s").unwrap();
+        symbol.push_str(&std::mem::take(&mut self.transmit));
+        write!(symbol, "\x1b[u\x1b[{right}C\x1b[{down}B").unwrap();
+
+        if let Some(cell) = buf.cell_mut((area.left(), area.top())) {
+            cell.set_symbol(&symbol);
+        }
+
+        // Fill remaining cells with dark bg so ratatui writes them to the
+        // terminal, preventing the white-background bleed-through.
+        let dark = Style::default().bg(Color::Rgb(18, 18, 30));
+        for y in 0..area.height {
+            let start_x = if y == 0 { 1 } else { 0 };
+            for x in start_x..area.width {
+                if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(dark);
                 }
             }
         }
