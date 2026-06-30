@@ -875,12 +875,15 @@ body {
   <!-- Horizontal resize handle between structure and MSA -->
   <div id="struct-h-handle"></div>
 
-  <!-- MSA panel (appears when MSA is run in TUI) -->
+  <!-- MSA panel -->
   <div id="msa-panel">
     <div id="msa-bar">
       <span id="msa-bar-label">MSA</span>
       <span id="msa-gene-name"></span>
-      <span id="msa-status">no alignment loaded — run MSA in TUI (select gene → m)</span>
+      <span id="msa-status">click a gene then Run MSA, or press m in TUI</span>
+      <div style="margin-left:auto">
+        <button class="dbtn" id="btn-run-msa" disabled>Run MSA</button>
+      </div>
     </div>
     <div id="msa-canvas-wrap">
       <canvas id="msa-canvas"></canvas>
@@ -988,6 +991,15 @@ body {
     <div class="cr">
       <input type="checkbox" id="opt-stopcodons" checked>
       <label for="opt-stopcodons">Stop codons (live + figure)</label>
+    </div>
+    <div class="cr" style="grid-column:1/-1">
+      <label for="opt-gencode" style="min-width:90px">Genetic code</label>
+      <select id="opt-gencode">
+        <option value="1">Standard</option>
+        <option value="11">Bacterial / Archaeal / Plastid</option>
+        <option value="2">Vertebrate Mitochondrial</option>
+        <option value="4">Mycoplasma / Spiroplasma</option>
+      </select>
     </div>
   </div>
   <hr class="osep">

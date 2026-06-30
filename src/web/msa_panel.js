@@ -170,6 +170,37 @@ document.addEventListener('keydown', e => {
   if (handled) { e.preventDefault(); e.stopPropagation(); renderMsa(); }
 });
 
+// ── Run MSA button ────────────────────────────────────────────────────────────
+function updateRunMsaBtn() {
+  const btn = document.getElementById('btn-run-msa');
+  if (!btn) return;
+  const gene = window.getSelectedGene ? window.getSelectedGene() : null;
+  const ready = gene && !gene.noncoding && ws && ws.readyState === WebSocket.OPEN;
+  btn.disabled = !ready;
+  btn.textContent = gene && !gene.noncoding ? `Run MSA: ${gene.name}` : 'Run MSA';
+}
+window.updateRunMsaBtn = updateRunMsaBtn;
+
+(function() {
+  const btn = document.getElementById('btn-run-msa');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const gene = window.getSelectedGene ? window.getSelectedGene() : null;
+    if (!gene || gene.noncoding) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({cmd: 'msa', gene: gene.name}));
+    // Show panel immediately so user sees the loading state
+    const panel = document.getElementById('msa-panel');
+    const handle = document.getElementById('msa-h-handle');
+    panel.classList.add('visible');
+    handle.classList.add('visible');
+    if (window._panelCbs && window._panelCbs['msa-panel']) {
+      window._panelCbs['msa-panel'].checked = true;
+    }
+    document.getElementById('msa-status').textContent = `Running MSA for ${gene.name}…`;
+  });
+})();
+
 // ── State update hook (called from websocket.js) ──────────────────────────────
 function onMsaStateUpdate() {
   if (!lastState) return;

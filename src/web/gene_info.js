@@ -1,5 +1,6 @@
 // ── Gene hover/click info bar ─────────────────────────────────────────────────
 let selectedGene = null;
+window.getSelectedGene = () => selectedGene;
 let _statusActive = false;
 
 function onStatusUpdate() {
@@ -73,6 +74,7 @@ function renderGeneInfo(f) {
     if (!g) {
       selectedGene = null;
       renderGeneInfo(null);
+      if (typeof updateRunMsaBtn === 'function') updateRunMsaBtn();
       return;
     }
     const idx = parseInt(g.dataset.idx, 10);
@@ -85,6 +87,7 @@ function renderGeneInfo(f) {
       selectedGene = f;
       renderGeneInfo(f);
     }
+    if (typeof updateRunMsaBtn === 'function') updateRunMsaBtn();
   });
 })();
 

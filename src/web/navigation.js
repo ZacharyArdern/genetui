@@ -27,18 +27,35 @@ function enterLocalMode() {
   vpSendTimer = setTimeout(sendViewport, 200);
 }
 
-// ── Wheel zoom ────────────────────────────────────────────────────────────────
+// ── Wheel: pinch/spread → zoom, two-finger scroll → pan ──────────────────────
+// On macOS: pinch fires wheel with ctrlKey=true; two-finger swipe fires with ctrlKey=false.
+// On Linux/Windows: Ctrl+scroll also zooms; plain scroll pans.
 document.addEventListener('wheel', e => {
   const panel = document.getElementById('live-panel');
   if (!e.composedPath().some(el => el===panel)) return;
   e.preventDefault();
   if (!lastState) return;
   enterLocalMode();
-  const rect=panel.getBoundingClientRect(), frac=(e.clientX-rect.left)/panel.clientWidth;
-  const span=localVE-localVS, factor=e.deltaY>0?1.18:1/1.18;
-  const newSpan=Math.max(10,span*factor), center=localVS+frac*span;
-  localVS=Math.round(center-frac*newSpan);
-  localVE=Math.round(localVS+newSpan);
+  const span = localVE - localVS;
+  const W = panel.clientWidth || window.innerWidth;
+
+  if (e.ctrlKey) {
+    // Pinch / Ctrl+scroll → zoom around cursor position
+    const rect = panel.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / W;
+    const factor = e.deltaY > 0 ? 1.18 : 1 / 1.18;
+    const newSpan = Math.max(10, span * factor);
+    const center = localVS + frac * span;
+    localVS = Math.round(center - frac * newSpan);
+    localVE = Math.round(localVS + newSpan);
+  } else {
+    // Two-finger scroll → pan (use dominant axis)
+    const raw = Math.abs(e.deltaX) >= Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    const shift = Math.round((raw / W) * span);
+    localVS += shift;
+    localVE += shift;
+  }
+
   clampLocal(); renderLocal(); scheduleAutoRender();
   if (typeof drawViewportMarker === 'function') drawViewportMarker();
 }, {passive:false});

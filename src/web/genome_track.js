@@ -5,8 +5,30 @@ const FH        = 19;
 const LEVEL_GAP = 24;
 const ARROW_H   = 14;
 const STOP_COL  = '#f85149';
-const STOP_SET  = new Set(['TAA','TAG','TGA']);
 const COMP      = {A:'T',T:'A',G:'C',C:'G',a:'t',t:'a',g:'c',c:'g'};
+
+// ── Genetic code tables ────────────────────────────────────────────────────────
+const GENETIC_CODES = {
+  '1':  { stops: new Set(['TAA','TAG','TGA']) },
+  '2':  { stops: new Set(['TAA','TAG','AGA','AGG']) },
+  '4':  { stops: new Set(['TAA','TAG']) },
+  '11': { stops: new Set(['TAA','TAG','TGA']) },
+};
+const AA_TABLE = {
+  TTT:'F',TTC:'F',TTA:'L',TTG:'L',CTT:'L',CTC:'L',CTA:'L',CTG:'L',
+  ATT:'I',ATC:'I',ATA:'I',ATG:'M',GTT:'V',GTC:'V',GTA:'V',GTG:'V',
+  TCT:'S',TCC:'S',TCA:'S',TCG:'S',CCT:'P',CCC:'P',CCA:'P',CCG:'P',
+  ACT:'T',ACC:'T',ACA:'T',ACG:'T',GCT:'A',GCC:'A',GCA:'A',GCG:'A',
+  TAT:'Y',TAC:'Y',TAA:'*',TAG:'*',CAT:'H',CAC:'H',CAA:'Q',CAG:'Q',
+  AAT:'N',AAC:'N',AAA:'K',AAG:'K',GAT:'D',GAC:'D',GAA:'E',GAG:'E',
+  TGT:'C',TGC:'C',TGA:'*',TGG:'W',CGT:'R',CGC:'R',CGA:'R',CGG:'R',
+  AGT:'S',AGC:'S',AGA:'R',AGG:'R',GGT:'G',GGC:'G',GGA:'G',GGG:'G',
+};
+function getStopSet() {
+  const sel = document.getElementById('opt-gencode');
+  return (GENETIC_CODES[(sel && sel.value) || '1'] || GENETIC_CODES['1']).stops;
+}
+function translateCodon(c) { return AA_TABLE[c.toUpperCase()] || '?'; }
 
 let lastState = null, localVS = 0, localVE = 0;
 let localMode = false, localModeTimer = null;
@@ -64,9 +86,9 @@ function arrowPts(x1,x2,cy,h,strand) {
 function rcSeq(s) {
   let r=''; for (let i=s.length-1;i>=0;i--) r += COMP[s[i]]||'N'; return r;
 }
-function stopPositions(seq, frame) {
-  const out=[], u=seq.toUpperCase();
-  for (let i=frame; i+2<u.length; i+=3) { if (STOP_SET.has(u.slice(i,i+3))) out.push(i); }
+function stopPositions(seq, frame, stopSet) {
+  const out=[], u=seq.toUpperCase(), s=stopSet||getStopSet();
+  for (let i=frame; i+2<u.length; i+=3) { if (s.has(u.slice(i,i+3))) out.push(i); }
   return out;
 }
 
@@ -160,15 +182,16 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop) {
   const rc      = rcSeq(seq);
   const seqLen  = seq.length;
   const showSC  = document.getElementById('opt-stopcodons').checked;
+  const stopSet = getStopSet();
   const fwdStops = [[],[],[]];
   const revStops = [[],[],[]];
   if (showSC && seq) {
     for (let rcFr = 0; rcFr < 3; rcFr++) {
-      for (const p of stopPositions(seq, rcFr)) {
+      for (const p of stopPositions(seq, rcFr, stopSet)) {
         const gp = seqOff + p;
         fwdStops[gp % 3].push(gp);
       }
-      for (const p of stopPositions(rc, rcFr)) {
+      for (const p of stopPositions(rc, rcFr, stopSet)) {
         const gEnd = seqOff + seqLen - p - 1;
         revStops[gEnd % 3].push(seqOff + seqLen - p - 2);
       }
@@ -179,6 +202,9 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop) {
   const ncYp = divY + FH*3 + 3;
   const ncYm = ncYp + FH + 2;
 
+  // Width of one codon in pixels — expands at high zoom so bars show actual codon span
+  const stopW = Math.max(1, Math.round(scale * 3));
+
   for (let fr=0;fr<3;fr++) {
     const bg = fr%2 ? '#0f1520' : '#0d1117';
     out.push(`<rect x="0" y="${yTop+FH*fr}" width="${W}" height="${FH}" fill="${bg}"/>`);
@@ -187,21 +213,59 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop) {
 
   out.push(`<line x1="0" y1="${divY}" x2="${W}" y2="${divY}" stroke="#30363d" stroke-width="1"/>`);
 
+  // ── Amino acid display (when zoomed in to ≥3 px/nt) ─────────────────────────
+  const showAA = seq && scale >= 3;
+  const aaFont = Math.min(11, Math.max(7, (scale * 2.2)|0));
+
+  if (showAA) {
+    const u = seq.toUpperCase();
+    const u_rc = rc.toUpperCase();
+    // Forward strand: for each display row fr, codons where (seqOff+p)%3==fr
+    for (let fr = 0; fr < 3; fr++) {
+      const cy = (yTop + FH*fr + FH/2 + 3)|0;
+      const pStart = ((fr - seqOff % 3 + 3) % 3); // first offset in seq for this frame row
+      for (let p = pStart; p + 2 < seqLen; p += 3) {
+        const gp = seqOff + p;
+        const cx = (gp + 1.5 - vs) * scale;
+        if (cx < -20 || cx > W + 20) continue;
+        const aa = translateCodon(u.slice(p, p + 3));
+        if (!aa || aa === '*') continue;
+        out.push(`<text x="${cx|0}" y="${cy}" text-anchor="middle" font-size="${aaFont}" fill="#4a5568" font-family="monospace">${aa}</text>`);
+      }
+    }
+    // Reverse strand: rc codon at position p → genome end = seqOff+seqLen-1-p, display row = gEnd%3
+    for (let rcFr = 0; rcFr < 3; rcFr++) {
+      for (let p = rcFr; p + 2 < seqLen; p += 3) {
+        const gEnd = seqOff + seqLen - 1 - p;
+        const gStart = gEnd - 2;
+        const cx = (gStart + 1.5 - vs) * scale;
+        if (cx < -20 || cx > W + 20) continue;
+        const fr = gEnd % 3;
+        const cy = (divY + FH*fr + FH/2 + 3)|0;
+        const aa = translateCodon(u_rc.slice(p, p + 3));
+        if (!aa || aa === '*') continue;
+        out.push(`<text x="${cx|0}" y="${cy}" text-anchor="middle" font-size="${aaFont}" fill="#4a5568" font-family="monospace">${aa}</text>`);
+      }
+    }
+  }
+
   for (let fr=0;fr<3;fr++) {
     const y1=yTop+FH*fr+2, y2=yTop+FH*(fr+1)-2;
     for (const gp of fwdStops[fr]) {
-      const x=(gp-vs)*scale;
-      if (x<-1||x>W+1) continue;
-      out.push(`<line x1="${x|0}" y1="${y1}" x2="${x|0}" y2="${y2}" stroke="${STOP_COL}" stroke-width="1" opacity="0.6"/>`);
+      const x = (gp - vs) * scale;
+      if (x < -stopW || x > W + stopW) continue;
+      const rx = Math.max(0, (x - stopW/2)|0);
+      out.push(`<rect x="${rx}" y="${y1}" width="${Math.min(stopW, W-rx)}" height="${y2-y1}" fill="${STOP_COL}" opacity="0.7" rx="1"/>`);
     }
     out.push(`<text x="3" y="${(yTop+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">+${fr+1}</text>`);
   }
   for (let fr=0;fr<3;fr++) {
     const y1=divY+FH*fr+2, y2=divY+FH*(fr+1)-2;
     for (const gp of revStops[fr]) {
-      const x=(gp-vs)*scale;
-      if (x<-1||x>W+1) continue;
-      out.push(`<line x1="${x|0}" y1="${y1}" x2="${x|0}" y2="${y2}" stroke="${STOP_COL}" stroke-width="1" opacity="0.6"/>`);
+      const x = (gp - vs) * scale;
+      if (x < -stopW || x > W + stopW) continue;
+      const rx = Math.max(0, (x - stopW/2)|0);
+      out.push(`<rect x="${rx}" y="${y1}" width="${Math.min(stopW, W-rx)}" height="${y2-y1}" fill="${STOP_COL}" opacity="0.7" rx="1"/>`);
     }
     out.push(`<text x="3" y="${(divY+FH*fr+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">-${fr+1}</text>`);
   }

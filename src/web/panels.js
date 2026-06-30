@@ -46,6 +46,7 @@ function optionChanged() { renderLocal(); scheduleAutoRender(); }
 ['opt-sixframe','opt-stopcodons','fig-ruler','fig-white','fig-show-labels','fig-hide-long-labels'].forEach(id=>{
   document.getElementById(id).addEventListener('change', optionChanged);
 });
+document.getElementById('opt-gencode').addEventListener('change', optionChanged);
 [['fig-width','lbl-width',1],['fig-fs','lbl-fs',0],['fig-overflow-thresh','lbl-overflow-thresh',3]].forEach(([id,lb,d])=>{
   document.getElementById(id).addEventListener('input', function(){
     document.getElementById(lb).textContent=parseFloat(this.value).toFixed(d);
@@ -86,7 +87,7 @@ document.getElementById('cov-style-fig').addEventListener('change', function(){
     const isStruct=(p.id==='struct-panel');
     const isMsa=(p.id==='msa-panel');
     const isCirc=(p.id==='circ-panel');
-    cb.checked=!isStruct&&!isMsa; cb.disabled=isStruct||isMsa;
+    cb.checked=!isStruct&&!isMsa; cb.disabled=isStruct;
     cb.addEventListener('change', ()=>{
       const el=document.getElementById(p.id);
       if (!el) return;
