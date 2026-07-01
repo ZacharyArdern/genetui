@@ -230,7 +230,7 @@ pub(super) fn draw_minimap(f: &mut Frame, app: &App, area: Rect) {
             }
             ctx.draw(&Points { coords: &track_pts, color: Color::Rgb(60, 60, 80) });
             if chromosome_active {
-                ctx.print(mx - char_w * 0.5, my, Line::styled(
+                ctx.print(mx - char_w * 0.5, my + line_h * 0.35, Line::styled(
                     "◆", Style::default().fg(Color::Yellow),
                 ));
                 ctx.print(you_x, you_y1, Line::styled(
@@ -520,7 +520,8 @@ fn draw_plasmid_minimap(f: &mut Frame, app: &App, plasmid_idx: usize, area: Rect
             }
             if is_active {
                 ctx.draw(&Points { coords: &p_track_pts, color: Color::Rgb(60, 60, 80) });
-                ctx.print(p_mx - p_char_w * 0.5, p_my, Line::styled(
+                let p_line_h = 2.0 * y_range / h;
+                ctx.print(p_mx - p_char_w * 0.5, p_my + p_line_h * 0.35, Line::styled(
                     "◆", Style::default().fg(Color::Yellow),
                 ));
                 ctx.print(p_you_x, p_you_y1, Line::styled(

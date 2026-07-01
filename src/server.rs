@@ -29,10 +29,15 @@ pub struct BrowserState {
     pub coverage_minus:     Vec<u32>,   // per-bin read depth, minus strand
     pub coverage_bin_size:  u64,        // bp per bin
     pub coverage_bin_start: u64,        // genomic position of first bin
+    pub reads_plus:  Vec<[u32; 2]>,    // per-read [start, end], + strand (only when zoomed in)
+    pub reads_minus: Vec<[u32; 2]>,    // per-read [start, end], - strand
     pub input_files: Vec<String>,       // source file paths (gff, fasta, bam)
     pub msa_gene: String,               // gene name for the active MSA (empty = none)
     pub msa_sequences: Vec<[String; 2]>,// [(id, aligned_sequence), …]
+    pub msa_error: String,              // MSA error message (empty = none)
     pub status_msg: String,             // progress message for slow tasks (empty = idle)
+    pub needs_dmnd_db: bool,            // browser should prompt for DIAMOND DB path
+    pub path_completions: Vec<String>,  // tab-completion candidates for browser DB picker
     pub gc_skew: Vec<f32>,              // downsampled GC skew values (-1..1) for circular map (legacy, kept for compatibility)
     pub active_genome: usize,
     pub main_name: String,
@@ -48,6 +53,10 @@ pub struct BrowserState {
     pub stop_codons_minus: Vec<Vec<u32>>,
     // DIAMOND blast hits overlaid as yellow features
     pub blast_features: Vec<BrowserFeature>,
+    // Ordered contig boundaries for multi-contig genomes (empty for single-contig / plasmids)
+    pub contig_names: Vec<String>,
+    pub contig_starts: Vec<u64>,
+    pub contig_ends: Vec<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -69,6 +78,8 @@ pub struct WebServer {
     fold_gene_cmd:      Arc<Mutex<Option<String>>>,
     msa_gene_cmd:       Arc<Mutex<Option<String>>>,
     switch_genome_cmd:  Arc<Mutex<Option<(usize, u64, u64)>>>,
+    set_dmnd_cmd:       Arc<Mutex<Option<String>>>,
+    complete_path_cmd:  Arc<Mutex<Option<String>>>,
 }
 
 impl WebServer {
@@ -81,6 +92,8 @@ impl WebServer {
             fold_gene_cmd:     Arc::new(Mutex::new(None)),
             msa_gene_cmd:      Arc::new(Mutex::new(None)),
             switch_genome_cmd: Arc::new(Mutex::new(None)),
+            set_dmnd_cmd:      Arc::new(Mutex::new(None)),
+            complete_path_cmd: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -98,6 +111,14 @@ impl WebServer {
 
     pub fn take_switch_cmd(&self) -> Option<(usize, u64, u64)> {
         self.switch_genome_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_set_dmnd_cmd(&self) -> Option<String> {
+        self.set_dmnd_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_complete_path_cmd(&self) -> Option<String> {
+        self.complete_path_cmd.lock().ok()?.take()
     }
 
     /// Push new state to all connected browser clients (sync-safe, callable from event loop).
@@ -149,12 +170,14 @@ async fn circular_map_svg(
         Err(_) => return ([("content-type", "image/svg+xml")], "<svg/>".to_string()),
     };
 
-    let (name, size, features, gc_skew) = if genome_idx == 0 {
+    let (name, size, features, gc_skew, contig_info) = if genome_idx == 0 {
         let n = if state.main_name.is_empty() { &state.genome_name } else { &state.main_name };
         let s = if state.main_size > 0 { state.main_size } else { state.genome_size };
         let f = if !state.main_features.is_empty() { &state.main_features } else { &state.features };
         let g = if !state.main_gc_skew.is_empty() { &state.main_gc_skew } else { &state.gc_skew };
-        (n.clone(), s, f.clone(), g.clone())
+        let ci: Vec<(u64, u64)> = state.contig_starts.iter().zip(state.contig_ends.iter())
+            .map(|(&s, &e)| (s, e)).collect();
+        (n.clone(), s, f.clone(), g.clone(), ci)
     } else {
         let pi = genome_idx - 1;
         if pi >= state.plasmid_names.len() {
@@ -170,12 +193,13 @@ async fn circular_map_svg(
             sz,
             pfeats,
             state.plasmid_gc_skew.get(pi).cloned().unwrap_or_default(),
+            vec![],
         )
     };
 
     let blast = state.blast_features.clone();
     drop(state);
-    let svg = build_circular_svg(&name, size, &features, &gc_skew, &blast, dark, show_nc, show_legend, title, genome_idx);
+    let svg = build_circular_svg(&name, size, &features, &gc_skew, &blast, dark, show_nc, show_legend, title, genome_idx, &contig_info);
     ([("content-type", "image/svg+xml")], svg)
 }
 
@@ -199,6 +223,7 @@ fn build_circular_svg(
     blast_features: &[BrowserFeature],
     dark: bool, show_nc: bool, show_legend: bool, custom_title: Option<&str>,
     id_sfx: usize,
+    contig_info: &[(u64, u64)],  // (start, end) per contig, ordered; empty = single contig
 ) -> String {
     if size == 0 { return "<svg/>".to_string(); }
 
@@ -394,33 +419,65 @@ fn build_circular_svg(
             if bf.end <= bf.start || bf.start >= size { continue; }
             let path = arc_path(bf.start, bf.end.min(size), rf(r_blast_i_f), rf(r_blast_o_f));
             let title = svg_esc(&bf.name);
-            svg.push_str(&format!("<path d=\"{path}\" fill=\"#e6b800\" stroke=\"none\"><title>{title}</title></path>\n"));
+            svg.push_str(&format!("<path d=\"{path}\" fill=\"#e040fb\" stroke=\"none\"><title>{title}</title></path>\n"));
         }
         svg.push_str("</g>\n");
     }
 
+    // ── Contig gap arcs + separator lines ────────────────────────────────────
+    if contig_info.len() > 1 {
+        let gap_fill  = if dark { "#161b22" } else { "#e8e8e8" };
+        let sep_color = if dark { "#58a6ff" } else { "#0066cc" };
+        for i in 0..contig_info.len().saturating_sub(1) {
+            let gap_s = contig_info[i].1;
+            let gap_e = contig_info[i + 1].0;
+            if gap_e > gap_s && gap_s < size {
+                let path = arc_path(gap_s, gap_e.min(size), rf(r_inner_f), rf(r_skew_o_f));
+                svg.push_str(&format!("<path d=\"{path}\" fill=\"{gap_fill}\" stroke=\"none\"/>\n"));
+            }
+            let sep = contig_info[i + 1].0;
+            if sep < size {
+                let a = pos_to_angle(sep);
+                let (ca, sa) = (a.cos(), a.sin());
+                svg.push_str(&format!(
+                    "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{sep_color}\" stroke-width=\"1.5\"/>\n",
+                    cx + rf(r_inner_f)*ca, cy + rf(r_inner_f)*sa,
+                    cx + rf(r_skew_o_f)*ca, cy + rf(r_skew_o_f)*sa,
+                ));
+            }
+        }
+    }
+
     // ── Tick marks + labels ────────────────────────────────────────────────────
+    let pos_in_contig = |p: u64| -> Option<u64> {
+        if contig_info.is_empty() { return Some(p); }
+        for &(cs, ce) in contig_info { if p >= cs && p <= ce { return Some(p - cs); } }
+        None
+    };
     let raw      = size / 8;
     let mag      = 10u64.pow(raw.max(1).ilog10());
     let interval = (raw / mag) * mag;
     let mut pos  = 0u64;
     while pos < size {
-        let a = pos_to_angle(pos);
-        let (ca, sa) = (a.cos(), a.sin());
-        svg.push_str(&format!(
-            r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{ring_color}" stroke-width="0.8"/>
+        // Skip ticks that fall in gap regions
+        if let Some(local) = pos_in_contig(pos) {
+            let a = pos_to_angle(pos);
+            let (ca, sa) = (a.cos(), a.sin());
+            svg.push_str(&format!(
+                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{ring_color}" stroke-width="0.8"/>
 "#,
-            cx + rf(r_inner_f)*ca, cy + rf(r_inner_f)*sa,
-            cx + rf(r_tick_o_f)*ca, cy + rf(r_tick_o_f)*sa,
-        ));
-        let label = if pos == 0 { "0".into() }
-            else if pos >= 1_000_000 { format!("{:.1}M", pos as f64 / 1e6) }
-            else { format!("{}k", pos / 1_000) };
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" text-anchor="middle" dominant-baseline="middle" font-size="11" font-family="sans-serif" fill="{fg}">{label}</text>
+                cx + rf(r_inner_f)*ca, cy + rf(r_inner_f)*sa,
+                cx + rf(r_tick_o_f)*ca, cy + rf(r_tick_o_f)*sa,
+            ));
+            let label = if local == 0 { "0".into() }
+                else if local >= 1_000_000 { format!("{:.1}M", local as f64 / 1e6) }
+                else { format!("{}k", local / 1_000) };
+            svg.push_str(&format!(
+                r#"<text x="{:.2}" y="{:.2}" text-anchor="middle" dominant-baseline="middle" font-size="11" font-family="sans-serif" fill="{fg}">{label}</text>
 "#,
-            cx + rf(r_lbl_f)*ca, cy + rf(r_lbl_f)*sa,
-        ));
+                cx + rf(r_lbl_f)*ca, cy + rf(r_lbl_f)*sa,
+            ));
+        }
         pos += interval;
     }
 
@@ -504,7 +561,7 @@ fn build_circular_svg(
             }
             if !blast_features.is_empty() {
                 v.push(LegRow { label: "DIAMOND", grad: gp.clone(), lo: String::new(), hi: String::new(),
-                    solid: Some("#e6b800".into()) });
+                    solid: Some("#e040fb".into()) });
             }
             v
         };
@@ -612,6 +669,20 @@ async fn handle_ws(socket: WebSocket, server: Arc<WebServer>) {
                                     }
                                 }
                             }
+                            if v["cmd"].as_str() == Some("set_dmnd") {
+                                if let Some(path) = v["path"].as_str() {
+                                    if let Ok(mut cmd) = server.set_dmnd_cmd.lock() {
+                                        *cmd = Some(path.to_string());
+                                    }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("complete_path") {
+                                if let Some(prefix) = v["prefix"].as_str() {
+                                    if let Ok(mut cmd) = server.complete_path_cmd.lock() {
+                                        *cmd = Some(prefix.to_string());
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -664,6 +735,7 @@ body {
 .disconnected { background: #6e7681; color: #fff; }
 #py-badge { background: #6e3694; color: #fff; display: none; }
 #py-badge.ready { background: #1a7f37; }
+.panel-focused { outline: 2px solid rgba(255,255,255,0.7); outline-offset: -2px; }
 .hbtn {
   padding: 2px 9px; border: 1px solid #30363d; background: #21262d;
   color: #c9d1d9; border-radius: 5px; font-size: 11px; cursor: pointer;
@@ -851,25 +923,35 @@ body {
   <span id="position">—</span>
   <span id="py-badge" class="badge">pyodide</span>
   <span id="status" class="badge disconnected">disconnected</span>
+  <span style="margin-left:auto;display:flex;gap:14px;font-size:11px;font-family:monospace">
+    <span style="color:#ffffff">/ search</span>
+    <span style="color:#ffffff">d panels</span>
+    <span style="color:#ffffff">q quit</span>
+    <span style="color:#8b949e">&#8592;&#8594; pan &nbsp; +/- zoom</span>
+  </span>
+</div>
+
+<!-- Search overlay (opened by /) -->
+<div id="search-overlay" style="display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,0.55);align-items:flex-start;justify-content:center">
+  <div style="margin-top:80px;width:440px;background:#161b22;border:1px solid #58a6ff;border-radius:8px;padding:12px 14px;box-shadow:0 8px 32px rgba(0,0,0,0.7)">
+    <input id="browser-search" type="text" placeholder="search gene or position (e.g. 12000-15000)&#8230;"
+      style="width:100%;box-sizing:border-box;font-size:12px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:5px 9px;font-family:monospace;outline:none"
+      autocomplete="off" spellcheck="false">
+    <div id="browser-search-results" style="display:none;margin-top:4px;border:1px solid #30363d;border-radius:5px;overflow-y:auto;max-height:220px"></div>
+    <div style="font-size:10px;color:#484f58;margin-top:6px">&#8593;&#8595; navigate &nbsp;&#183;&nbsp; Enter confirm &nbsp;&#183;&nbsp; Esc close</div>
+  </div>
 </div>
 
 <!-- Main browser bar -->
 <div id="main-browser-bar">
   <span id="main-browser-label">Main browser</span>
-  <form id="browser-search-form" style="display:flex;gap:4px;margin-left:10px" onsubmit="return false">
-    <input id="browser-search" type="text" placeholder="search gene / position&#8230;"
-      style="font-size:11px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 7px;width:200px;font-family:monospace;outline:none"
-      autocomplete="off" spellcheck="false">
-    <button class="dbtn" type="submit" id="btn-browser-search">&#128269;</button>
-  </form>
-  <div id="browser-search-results" style="display:none;position:fixed;z-index:400;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:4px 0;min-width:260px;max-height:200px;overflow-y:auto;box-shadow:0 4px 20px rgba(0,0,0,.7);font-family:monospace;font-size:11px"></div>
   <div style="margin-left:auto;display:flex;gap:5px">
     <button class="dbtn" id="btn-main-browser-opts">&#9881; Options</button>
   </div>
 </div>
 
 <!-- Live SVG track -->
-<div id="live-panel" style="height:55vh">
+<div id="live-panel" style="height:36vh">
   <div id="fancy-layer"></div>
   <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
 </div>
@@ -880,7 +962,12 @@ body {
 <!-- Gene info bar -->
 <div id="gene-info-bar" class="empty">
   <span class="gi-name">—</span>
-  <span class="gi-hint">hover or click a gene in the track above</span>
+  <span class="gi-hint">hover or click a gene in the track above &nbsp;&#183;&nbsp;
+    <span style="color:#ffffff">/ search</span> &nbsp;
+    <span style="color:#ffffff">d panels</span> &nbsp;
+    <span style="color:#ffffff">q quit</span> &nbsp;
+    <span style="color:#8b949e">&#8592;&#8594; pan &nbsp; +/- zoom</span>
+  </span>
 </div>
 
 <!-- Bottom row: structure (left) + custom gene plot (right) -->
@@ -950,6 +1037,8 @@ body {
       <span id="circ-bar-label">Circular map</span>
       <span id="circ-status">enable panel (d) to render</span>
       <div style="margin-left:auto;display:flex;gap:5px">
+        <button class="dbtn" id="btn-circ-zoom-out" title="Zoom out (scroll wheel also works)">−</button>
+        <button class="dbtn" id="btn-circ-zoom-in"  title="Zoom in">+</button>
         <button class="dbtn" id="btn-circ-opts">&#9881; Options</button>
         <button class="dbtn" id="btn-circ-render">Render</button>
         <button class="dbtn" id="btn-circ-png">PNG</button>
@@ -1025,6 +1114,11 @@ body {
       <label for="opt-stopcodons">Stop codons</label>
     </div>
     <div class="cr" style="grid-column:1/-1">
+      <label for="opt-codons" style="min-width:90px">Codon highlight</label>
+      <input type="text" id="opt-codons" placeholder="e.g. ATG,TTG,GTG"
+        style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:3px;padding:2px 6px;font-size:11px;font-family:monospace">
+    </div>
+    <div class="cr" style="grid-column:1/-1">
       <label for="opt-gencode" style="min-width:90px">Genetic code</label>
       <select id="opt-gencode">
         <option value="1">Standard</option>
@@ -1037,15 +1131,15 @@ body {
       <label for="cov-style-svg">Coverage (live)</label>
       <select id="cov-style-svg">
         <option value="none">None</option>
-        <option value="both">Both strands</option>
-        <option value="plus">Plus strand</option>
-        <option value="minus">Minus strand</option>
+        <option value="histogram">Histogram</option>
+        <option value="kernel">Kernel (smoothed)</option>
+        <option value="reads">Raw reads</option>
       </select>
     </div>
-    <div class="cr" style="grid-column:1/-1">
+    <div class="cr" style="grid-column:1/-1" id="cov-height-row" style="display:none">
       <label for="cov-height">Coverage height</label>
-      <input type="range" id="cov-height" min="20" max="120" step="5" value="50">
-      <span class="cv" id="lbl-cov-height">50</span><span style="font-size:10px">px</span>
+      <input type="range" id="cov-height" min="30" max="150" step="5" value="70">
+      <span class="cv" id="lbl-cov-height">70</span><span style="font-size:10px">px</span>
     </div>
   </div>
 </div>

@@ -50,6 +50,9 @@ function buildPyCode(vs,ve,forPng) {
   const white     = document.getElementById('fig-white').checked;
   const sixframe  = document.getElementById('opt-sixframe').checked;
   const stopCod   = document.getElementById('opt-stopcodons').checked;
+  const hlCodonEl = document.getElementById('opt-codons');
+  const hlCodonsArr = hlCodonEl ? hlCodonEl.value.toUpperCase().split(/[,\s]+/).map(s=>s.trim()).filter(s=>s.length===3) : [];
+  const pyHlCodons = hlCodonsArr.length ? `{'${hlCodonsArr.join("','")}'}` : 'set()';
   const seqLen    = Math.max(1,ve-vs);
   const feats     = lastState.features.filter(f=>f.start<=ve&&f.end>=vs);
   const bg        = white?"'white'":"'#0d1117'";
@@ -72,7 +75,22 @@ function buildPyCode(vs,ve,forPng) {
       pyCovBinOff = covBinOff + fb * covBinSz;
     }
   }
-  const hasCov = covStyle !== 'none' && pyCovPlus !== '[]';
+  // Actual per-read data (only present when viewport ≤ 50kb)
+  const rawRp = lastState.reads_plus  || [];
+  const rawRm = lastState.reads_minus || [];
+  const pyReadsPlus  = (covStyle === 'reads' && rawRp.length)
+    ? JSON.stringify(rawRp.filter(r => r[1] >= vs && r[0] <= ve)) : '[]';
+  const pyReadsMinus = (covStyle === 'reads' && rawRm.length)
+    ? JSON.stringify(rawRm.filter(r => r[1] >= vs && r[0] <= ve)) : '[]';
+  const hasCov = covStyle !== 'none' && (pyCovPlus !== '[]' || pyReadsPlus !== '[]');
+
+  // Contig boundary info for per-contig axis labels and separator lines
+  const _cnames = lastState.contig_names || [];
+  const _cstarts = lastState.contig_starts || [];
+  const _cends = lastState.contig_ends || [];
+  const pyContigs = JSON.stringify(_cnames.map((n,i)=>({n,s:_cstarts[i],e:_cends[i]})));
+  // Contig separator positions visible in this viewport (relative coords)
+  const visContigSeps = _cstarts.slice(1).filter(s => s > vs && s < ve).map(s => s - vs);
 
   const charWidthIn = (fs / 11) * parseFloat(document.getElementById('fig-overflow-thresh').value);
   function labelFitsInFeature(f) {
@@ -111,24 +129,24 @@ ${pyFeats}
         return ''.join(_COMP.get(c,'N') for c in reversed(s.upper()))
     _seq_sub=globals().get('_seq_sub',''); _seq_sub_off=globals().get('_seq_sub_off',0)
     _geno_off=${vs}+_seq_sub_off
-    _fwd_stops=[[],[],[]]
-    _rev_stops=[[],[],[]]
-    if _stopCod and _seq_sub:
-        _u=_seq_sub.upper()
-        _rc_u=_rc(_seq_sub)
+    _fwd_stops=[[],[],[]]; _rev_stops=[[],[],[]]
+    _HL_CODONS=${pyHlCodons}
+    _fwd_hl=[[],[],[]]; _rev_hl=[[],[],[]]
+    if _seq_sub:
+        _u=_seq_sub.upper(); _rc_u=_rc(_seq_sub)
         for _i in range(len(_u)-2):
-            if _u[_i:_i+3] in _STOP:
-                _gfr=(_geno_off+_i)%3
-                _fwd_stops[_gfr].append(_seq_sub_off+_i)
+            _cdn=_u[_i:_i+3]; _gfr=(_geno_off+_i)%3
+            if _stopCod and _cdn in _STOP: _fwd_stops[_gfr].append(_seq_sub_off+_i)
+            if _HL_CODONS and _cdn in _HL_CODONS: _fwd_hl[_gfr].append(_seq_sub_off+_i)
         for _i in range(len(_rc_u)-2):
-            if _rc_u[_i:_i+3] in _STOP:
-                _gend=_geno_off+len(_seq_sub)-_i-1
-                _gfr=_gend%3
-                _rev_stops[_gfr].append(_seq_sub_off+len(_seq_sub)-_i-2)
+            _cdn=_rc_u[_i:_i+3]; _gend=_geno_off+len(_seq_sub)-_i-1; _gfr=_gend%3
+            if _stopCod and _cdn in _STOP: _rev_stops[_gfr].append(_seq_sub_off+len(_seq_sub)-_i-2)
+            if _HL_CODONS and _cdn in _HL_CODONS: _rev_hl[_gfr].append(_seq_sub_off+len(_seq_sub)-_i-2)
     _ROWS=[('+1',1,0),('+2',1,1),('+3',1,2),('-1',-1,0),('-2',-1,1),('-3',-1,2)]
     _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
     _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
-    _has_cov=_cov_style!='none' and len(_cov_plus)>0
+    _reads_plus=${pyReadsPlus}; _reads_minus=${pyReadsMinus}
+    _has_cov=_cov_style!='none' and (len(_cov_plus)>0 or len(_reads_plus)>0)
     # row order: cov+? / nc+ / +1/+2/+3 / sep / -1/-2/-3 / nc- / cov-?
     _hr=([1.4] if _has_cov else [])+[0.45,0.75,0.75,0.75,0.25,0.75,0.75,0.75,0.45]+([1.4] if _has_cov else [])
     _off=1 if _has_cov else 0
@@ -137,12 +155,22 @@ ${pyFeats}
     fig.patch.set_facecolor(_bg)
     gs=gridspec.GridSpec(len(_hr),1,figure=fig,hspace=0.0,
         height_ratios=_hr,top=0.96,bottom=0.09,left=0.11,right=0.98)
-    import matplotlib.ticker as _tck
+    import matplotlib.ticker as _tck,json as _json
+    _CONTIGS=_json.loads('${pyContigs}')
+    _CONTIG_SEPS=${JSON.stringify(visContigSeps)}
     def _gfmt(x,p):
-        v=int(x)+${vs}
-        if v>=1000000: return f'{v//1000000}M'
-        if v>=1000: return f'{v//1000}k'
-        return str(v)
+        g=int(x)+${vs}
+        if _CONTIGS:
+            for _c in _CONTIGS:
+                if _c['s']<=g<=_c['e']:
+                    _v=g-_c['s']+1
+                    if _v>=1000000: return f'{_v/1000000:.2f}M'
+                    if _v>=1000: return f'{_v/1000:.1f}k'
+                    return str(_v)
+        _v=g
+        if _v>=1000000: return f'{_v//1000000}M'
+        if _v>=1000: return f'{_v//1000}k'
+        return str(_v)
     _bpfmt=_tck.FuncFormatter(_gfmt)
     _axes=[]
     for _ri,(_lbl,_si,_fr) in enumerate(_ROWS):
@@ -162,10 +190,15 @@ ${pyFeats}
         for sp in ax.spines.values(): sp.set_color(_fg)
         ax.tick_params(colors=_fg,labelsize=${fs-2})
         ax.set_xticklabels([])
-        if _stopCod and _seq_sub:
-            _sc_list=_fwd_stops[_fr] if _si==1 else _rev_stops[_fr]
-            for _x in _sc_list:
-                ax.axvline(_x,color='black',alpha=0.7,linewidth=0.8)
+        if _seq_sub:
+            if _stopCod:
+                for _x in (_fwd_stops[_fr] if _si==1 else _rev_stops[_fr]):
+                    ax.axvline(_x,color='black',alpha=0.7,linewidth=0.8)
+            if _HL_CODONS:
+                for _x in (_fwd_hl[_fr] if _si==1 else _rev_hl[_fr]):
+                    ax.axvspan(_x,_x+3,color='#3fb950',alpha=0.32,linewidth=0,zorder=3)
+            for _sx in _CONTIG_SEPS:
+                ax.axvline(_sx,color='#58a6ff',linewidth=0.8,linestyle='--',alpha=0.6,zorder=4)
         _axes.append(ax)
     _nc_p=[GraphicFeature(start=s,end=e,strand=st,label=lb,color=col) for (s,e,st,lb,col,nc,fr) in _feats_raw if nc and st==1]
     _nc_m=[GraphicFeature(start=s,end=e,strand=st,label=lb,color=col) for (s,e,st,lb,col,nc,fr) in _feats_raw if nc and st==-1]
@@ -180,6 +213,8 @@ ${pyFeats}
         if _show_x:
             _anc.xaxis.set_major_formatter(_bpfmt)
             _anc.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
+        for _sx in _CONTIG_SEPS:
+            _anc.axvline(_sx,color='#58a6ff',linewidth=0.8,linestyle='--',alpha=0.6,zorder=4)
     _ax_sep=fig.add_subplot(gs[_off+4])
     _ax_sep.set_visible(False)
     _pos3 =_axes[2].get_position()
@@ -195,7 +230,8 @@ ${pyFeats}
         _lm=_np.log10(_np.array(_cov_minus,dtype=float)+1)
         _mxp=max(float(_lp.max()) if len(_lp) else 1,0.01)
         _mxm=max(float(_lm.max()) if len(_lm) else 1,0.01)
-        def _cov_panel(ax,xs,raw,col,label,invert=False,show_xaxis=False):
+        def _cov_panel(ax,xs,raw,col,label,actual_reads=None,invert=False,show_xaxis=False):
+            from matplotlib.patches import Rectangle; from matplotlib.collections import PatchCollection
             ax.set_facecolor(_bg)
             for sp in ax.spines.values(): sp.set_color(_fg)
             ax.tick_params(colors=_fg,labelsize=${fs-2})
@@ -206,30 +242,42 @@ ${pyFeats}
                 ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
             else:
                 ax.set_xticklabels([])
+            _rh,_rg,_mr=0.8,0.3,25
             if _cov_style=='reads':
-                from matplotlib.patches import Rectangle
-                from matplotlib.collections import PatchCollection
-                _rh,_rg,_mr=0.8,0.3,20
-                def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
                 _rects=[]
-                for _i,(_x,_c) in enumerate(zip(xs,raw)):
-                    if _c==0: continue
-                    _sd=_i*(67890 if invert else 12345)
-                    for _r in range(min(_mr,int(_c))):
-                        _sd=_lcg(_sd)
-                        _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
-                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
-                        _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
-                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
-                ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
-                _rd_ticks=[v for v in [5,10,20] if v<=_mr]
+                if actual_reads:
+                    _min_rw=max(float(${seqLen})/(${width}*${dpi})*2, 1.0)  # ≥2px in data units
+                    _row_ends=[]
+                    for (_rs,_re) in sorted(actual_reads,key=lambda r:r[0]):
+                        _rx=_rs-${vs}; _rw=max(_min_rw,float(_re-_rs))
+                        if _rx+_rw<0 or _rx>${seqLen}: continue
+                        _row=0
+                        while _row<len(_row_ends) and _row_ends[_row]>_rx: _row+=1
+                        if _row>=_mr: continue
+                        if _row>=len(_row_ends): _row_ends.append(_rx+_rw)
+                        else: _row_ends[_row]=_rx+_rw
+                        _ry=_row*(_rh+_rg)
+                        _rects.append(Rectangle((_rx,_ry),_rw,_rh))
+                else:
+                    def _lcg(s): return (1664525*s+1013904223)&0xFFFFFFFF
+                    for _i,(_x,_c) in enumerate(zip(xs,raw)):
+                        if _c==0: continue
+                        _sd=_i*(67890 if invert else 12345)
+                        for _r in range(min(_mr,int(_c))):
+                            _sd=_lcg(_sd)
+                            _rw=max(1.0,_cov_bin_sz*(0.38+((_sd&0xff)/256-0.5)*0.2))
+                            _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
+                            _rects.append(Rectangle((_rx,_r*(_rh+_rg)),_rw,_rh))
+                if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.8,linewidth=0))
+                ax.set_ylim(0,_mr*(_rh+_rg)); ax.set_xlim(0,${seqLen})
+                _rd_ticks=[v for v in [5,10,20,25] if v<=_mr]
                 ax.set_yticks([v*(_rh+_rg) for v in _rd_ticks])
                 ax.set_yticklabels([str(v) for v in _rd_ticks],fontsize=6)
             else:
                 lv=_np.log10(_np.array(raw,dtype=float)+1)
                 mx=max(float(lv.max()) if len(lv) else 1,0.01)
                 if _cov_style=='histogram':
-                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
+                    ax.bar(xs,list(lv),width=_cov_bin_sz*0.55,align='edge',color=col,alpha=0.75)
                 else:
                     _sigma=0.8; _r=int(_np.ceil(3*_sigma))
                     _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
@@ -240,8 +288,8 @@ ${pyFeats}
                 ax.set_yticks([_np.log10(v+1) for v in _ytv])
                 ax.set_yticklabels([str(v) for v in _ytv],fontsize=6)
             if invert: ax.invert_yaxis()
-        _cov_panel(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+')
-        _cov_panel(fig.add_subplot(gs[-1]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',invert=True,show_xaxis=True)
+        _cov_panel(fig.add_subplot(gs[0]),_xs,list(_np.array(_cov_plus)),'#58a6ff','cov+',actual_reads=_reads_plus or None)
+        _cov_panel(fig.add_subplot(gs[-1]),_xs,list(_np.array(_cov_minus)),'#f78166','cov-',actual_reads=_reads_minus or None,invert=True,show_xaxis=True)
     buf=io.BytesIO()
     fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
     plt.close(fig); buf.seek(0)
@@ -275,15 +323,39 @@ ${pyFeatsSingle}
     _f_nc_p=[GraphicFeature(start=s,end=e,strand=si,label=lb,color=col) for (s,e,si,lb,col,nc,isp) in _feats_raw if nc and isp]
     _f_nc_m=[GraphicFeature(start=s,end=e,strand=si,label=lb,color=col) for (s,e,si,lb,col,nc,isp) in _feats_raw if nc and not isp]
     _has_c=bool(_f_c); _has_nc_p=bool(_f_nc_p); _has_nc_m=bool(_f_nc_m)
+    import json as _json
+    _CONTIGS=_json.loads('${pyContigs}')
+    _CONTIG_SEPS=${JSON.stringify(visContigSeps)}
     def _gfmt(x,p):
-        v=int(x)+${vs}
-        if v>=1000000: return f'{v//1000000}M'
-        if v>=1000: return f'{v//1000}k'
-        return str(v)
+        g=int(x)+${vs}
+        if _CONTIGS:
+            for _c in _CONTIGS:
+                if _c['s']<=g<=_c['e']:
+                    _v=g-_c['s']+1
+                    if _v>=1000000: return f'{_v/1000000:.2f}M'
+                    if _v>=1000: return f'{_v/1000:.1f}k'
+                    return str(_v)
+        _v=g
+        if _v>=1000000: return f'{_v//1000000}M'
+        if _v>=1000: return f'{_v//1000}k'
+        return str(_v)
     _bpfmt=_tck.FuncFormatter(_gfmt)
+    _COMP={'A':'T','T':'A','G':'C','C':'G'}
+    def _rc(s): return ''.join(_COMP.get(c,'N') for c in reversed(s.upper()))
+    _seq_sub=globals().get('_seq_sub',''); _seq_sub_off=globals().get('_seq_sub_off',0)
+    _geno_off=${vs}+_seq_sub_off
+    _HL_CODONS=${pyHlCodons}
+    _fwd_hl=[]; _rev_hl=[]
+    if _HL_CODONS and _seq_sub:
+        _u=_seq_sub.upper(); _rc_u=_rc(_seq_sub)
+        for _i in range(len(_u)-2):
+            if _u[_i:_i+3] in _HL_CODONS: _fwd_hl.append(_seq_sub_off+_i)
+        for _i in range(len(_rc_u)-2):
+            if _rc_u[_i:_i+3] in _HL_CODONS: _rev_hl.append(_seq_sub_off+len(_seq_sub)-_i-2)
     _cov_style='${covStyle}'; _cov_plus=${pyCovPlus}; _cov_minus=${pyCovMinus}
     _cov_bin_sz=${pyCovBinSz}; _cov_bin_off=${pyCovBinOff}
-    _has_cov=_cov_style!='none' and len(_cov_plus)>0
+    _reads_plus=${pyReadsPlus}; _reads_minus=${pyReadsMinus}
+    _has_cov=_cov_style!='none' and (len(_cov_plus)>0 or len(_reads_plus)>0)
     # Assign explicit gridspec row indices: cov+ / nc+ / coding / nc- / cov-
     _nrows=0; _hr=[]
     _ri_cov_p=_ri_nc_p=_ri_c=_ri_nc_m=_ri_cov_m=-1
@@ -297,26 +369,42 @@ ${pyFeatsSingle}
     gs=gridspec.GridSpec(_nrows,1,figure=fig,height_ratios=_hr,hspace=0.04,top=0.97,bottom=0.09,left=0.11,right=0.98)
     import numpy as _np
     _xs=[(_cov_bin_off+i*_cov_bin_sz-${vs}) for i in range(len(_cov_plus))] if _has_cov else []
-    def _cov_panel(ax,raw,col,label,invert=False,show_xaxis=False):
+    def _cov_panel(ax,raw,col,label,actual_reads=None,invert=False,show_xaxis=False):
+        from matplotlib.patches import Rectangle; from matplotlib.collections import PatchCollection
         ax.set_facecolor(_bg)
         for sp in ax.spines.values(): sp.set_color(_fg)
         ax.tick_params(colors=_fg,labelsize=${fs-2})
         ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=38,va='center',color=_fg)
         ax.set_xlim(0,_seqLen)
+        _rh,_rg,_mr=0.8,0.3,25
         if _cov_style=='reads':
-            from matplotlib.patches import Rectangle; from matplotlib.collections import PatchCollection
-            _rh,_rg,_mr=0.8,0.3,20; _lcg=lambda s:(1664525*s+1013904223)&0xFFFFFFFF; _rects=[]
-            for _i,(_x,_c) in enumerate(zip(_xs,raw)):
-                if _c==0: continue
-                _sd=_i*(67890 if invert else 12345)
-                for _r2 in range(min(_mr,int(_c))):
-                    _sd=_lcg(_sd); _rw=max(1.0,_cov_bin_sz*(0.55+((_sd&0xff)/256-0.5)*0.3))
-                    _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw)); _rects.append(Rectangle((_rx,_r2*(_rh+_rg)),_rw,_rh))
-            if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.65,linewidth=0))
-            ax.set_ylim(0,_mr*(_rh+_rg)); ax.autoscale_view()
+            _rects=[]
+            if actual_reads:
+                _min_rw=max(_seqLen/(${width}*${dpi})*2, 1.0)  # ≥2px in data units
+                _row_ends=[]
+                for (_rs,_re) in sorted(actual_reads,key=lambda r:r[0]):
+                    _rx=_rs-${vs}; _rw=max(_min_rw,float(_re-_rs))
+                    if _rx+_rw<0 or _rx>_seqLen: continue
+                    _row=0
+                    while _row<len(_row_ends) and _row_ends[_row]>_rx: _row+=1
+                    if _row>=_mr: continue
+                    if _row>=len(_row_ends): _row_ends.append(_rx+_rw)
+                    else: _row_ends[_row]=_rx+_rw
+                    _rects.append(Rectangle((_rx,_row*(_rh+_rg)),_rw,_rh))
+            else:
+                _lcg=lambda s:(1664525*s+1013904223)&0xFFFFFFFF
+                for _i,(_x,_c) in enumerate(zip(_xs,raw)):
+                    if _c==0: continue
+                    _sd=_i*(67890 if invert else 12345)
+                    for _r2 in range(min(_mr,int(_c))):
+                        _sd=_lcg(_sd); _rw=max(1.0,_cov_bin_sz*(0.38+((_sd&0xff)/256-0.5)*0.2))
+                        _rx=_x+max(0,((_sd>>8)&0xff)/256*(_cov_bin_sz-_rw))
+                        _rects.append(Rectangle((_rx,_r2*(_rh+_rg)),_rw,_rh))
+            if _rects: ax.add_collection(PatchCollection(_rects,facecolor=col,alpha=0.8,linewidth=0))
+            ax.set_ylim(0,_mr*(_rh+_rg)); ax.set_xlim(0,_seqLen)
         else:
             lv=_np.log10(_np.array(raw,dtype=float)+1); mx=max(float(lv.max()) if len(lv) else 1,0.01)
-            if _cov_style=='histogram': ax.bar(_xs,list(lv),width=_cov_bin_sz*0.9,align='edge',color=col,alpha=0.75)
+            if _cov_style=='histogram': ax.bar(_xs,list(lv),width=_cov_bin_sz*0.55,align='edge',color=col,alpha=0.75)
             else:
                 _sigma=0.8; _r=int(_np.ceil(3*_sigma)); _k=_np.exp(-0.5*(_np.arange(-_r,_r+1)/_sigma)**2); _k/=_k.sum()
                 _sm=_np.convolve(lv,_k,mode='same'); ax.fill_between(_xs,_sm,alpha=0.2,color=col); ax.plot(_xs,_sm,color=col,linewidth=1.2)
@@ -330,24 +418,35 @@ ${pyFeatsSingle}
         else:
             ax.set_xticklabels([])
     def _gene_panel(ax,rec,label,lpad,show_xaxis):
-        # with_ruler=True keeps x-axis enabled; with_ruler=False calls ax.axis('off')
         rec.plot(ax=ax,with_ruler=show_xaxis,draw_line=True)
         ax.set_facecolor(_bg)
         for sp in ax.spines.values(): sp.set_color(_fg)
         ax.set_ylabel(label,fontsize=7,rotation=0,labelpad=lpad,va='center',color=_fg)
         for t in ax.texts: t.set_fontsize(${fs})
         if show_xaxis:
-            # override dna_features_viewer's relative-coord formatter with absolute-coord one
             ax.xaxis.set_major_formatter(_bpfmt)
             ax.tick_params(axis='x',colors=_fg,labelsize=${fs-2})
+        return ax
     _nc_p_show_x =_has_nc_p and not _has_c and not _has_nc_m and not _has_cov
     _c_show_x    =_has_c    and not _has_nc_m and not _has_cov
     _nc_m_show_x =_has_nc_m and not _has_cov
-    if _ri_cov_p>=0: _cov_panel(fig.add_subplot(gs[_ri_cov_p]),_cov_plus, '#58a6ff','cov+')
-    if _ri_nc_p >=0: _gene_panel(fig.add_subplot(gs[_ri_nc_p]), GraphicRecord(sequence_length=_seqLen,features=_f_nc_p),'nc+',22,_nc_p_show_x)
-    if _ri_c    >=0: _gene_panel(fig.add_subplot(gs[_ri_c]),    GraphicRecord(sequence_length=_seqLen,features=_f_c),    'genes',30,_c_show_x)
-    if _ri_nc_m >=0: _gene_panel(fig.add_subplot(gs[_ri_nc_m]), GraphicRecord(sequence_length=_seqLen,features=_f_nc_m),'nc-',22,_nc_m_show_x)
-    if _ri_cov_m>=0: _cov_panel(fig.add_subplot(gs[_ri_cov_m]),_cov_minus,'#f78166','cov-',invert=True,show_xaxis=True)
+    _g_axes=[]
+    if _ri_cov_p>=0: _cov_panel(fig.add_subplot(gs[_ri_cov_p]),_cov_plus, '#58a6ff','cov+',actual_reads=_reads_plus or None)
+    if _ri_nc_p >=0: _g_axes.append(_gene_panel(fig.add_subplot(gs[_ri_nc_p]), GraphicRecord(sequence_length=_seqLen,features=_f_nc_p),'nc+',22,_nc_p_show_x))
+    if _ri_c    >=0: _g_axes.append(_gene_panel(fig.add_subplot(gs[_ri_c]),    GraphicRecord(sequence_length=_seqLen,features=_f_c),    'genes',30,_c_show_x))
+    if _ri_nc_m >=0: _g_axes.append(_gene_panel(fig.add_subplot(gs[_ri_nc_m]), GraphicRecord(sequence_length=_seqLen,features=_f_nc_m),'nc-',22,_nc_m_show_x))
+    if _ri_cov_m>=0: _cov_panel(fig.add_subplot(gs[_ri_cov_m]),_cov_minus,'#f78166','cov-',actual_reads=_reads_minus or None,invert=True,show_xaxis=True)
+    if _HL_CODONS and _seq_sub:
+        _all_hl=_fwd_hl+_rev_hl
+        for _pax in _g_axes:
+            _yl=_pax.get_ylim()
+            for _x in _all_hl:
+                _pax.axvspan(_x,_x+3,color='#3fb950',alpha=0.32,linewidth=0,zorder=3)
+            _pax.set_ylim(_yl)
+    if _CONTIG_SEPS:
+        for _pax in _g_axes:
+            for _sx in _CONTIG_SEPS:
+                _pax.axvline(_sx,color='#58a6ff',linewidth=0.8,linestyle='--',alpha=0.6,zorder=4)
     buf=io.BytesIO()
     fig.savefig(buf,format='${fmt_}',dpi=${dpi},bbox_inches='tight',facecolor=_bg)
     plt.close(fig); buf.seek(0)

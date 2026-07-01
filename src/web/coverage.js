@@ -37,10 +37,15 @@ function drawCoverageStrand(state, vs, ve, W, yBase, trackH, isPlus, out) {
   if (style === 'histogram') {
     for (let i=0; i<vd.length; i++) {
       if (!vd[i]) continue;
-      const x1=Math.max(0,bx1(i)), x2=Math.min(W,bx2(i)); if (x2<=x1) continue;
-      const bw=Math.max(1,x2-x1)|0, px=x1|0, h=toH(vd[i])|0;
+      const rx1=bx1(i), rx2=bx2(i); if (rx2<=rx1) continue;
+      const fullW=rx2-rx1;
+      const barW=Math.max(1, fullW*0.55)|0;
+      const px=(rx1+(fullW-barW)*0.5)|0;
+      const clampX=Math.max(0,px), clampW=Math.min(barW,W-clampX);
+      if (clampW<=0) continue;
+      const h=toH(vd[i])|0;
       const y = isPlus ? yBase+trackH-2-h : yBase+2;
-      out.push(`<rect x="${px}" y="${y}" width="${bw}" height="${h}" fill="${col}" opacity="0.75"/>`);
+      out.push(`<rect x="${clampX}" y="${y}" width="${clampW}" height="${h}" fill="${col}" opacity="0.75"/>`);
     }
   } else if (style === 'kernel') {
     const sm = gaussSmooth1D(vd, 0.8);
@@ -53,21 +58,44 @@ function drawCoverageStrand(state, vs, ve, W, yBase, trackH, isPlus, out) {
       out.push(`<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" opacity="0.9"/>`);
     }
   } else { // reads
-    const rh=2, rg=1, maxR=Math.floor((trackH-6)/(rh+rg));
-    function lcg(s) { return (Math.imul(s,1664525)+1013904223)|0; }
-    for (let i=0; i<vd.length; i++) {
-      const x1=Math.max(0,bx1(i))|0, x2=Math.min(W,bx2(i))|0; if (x2<=x1) continue;
-      const bw=x2-x1;
-      let seed=(firstBin+i)*(isPlus?12345:67890);
-      for (let r=0; r<Math.min(maxR,vd[i]); r++) {
-        seed=lcg(seed);
-        const rw=Math.max(3,(bw*0.55+((seed&0xff)/256-0.5)*bw*0.3))|0;
-        const rx=x1+Math.max(0,(((seed>>8)&0xff)/256)*(bw-rw))|0;
-        if (isPlus) {
-          const ry=yBase+trackH-4-r*(rh+rg); if (ry<yBase+2) break;
-          out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
-        } else {
-          const ry=yBase+3+r*(rh+rg); if (ry+rh>yBase+trackH-2) break;
+    const actualReads = isPlus ? (state.reads_plus || []) : (state.reads_minus || []);
+    if (actualReads.length > 0) {
+      // Draw actual reads at exact genomic coordinates, stacked greedily
+      const rh=2, rg=1, maxRows=Math.floor((trackH-6)/(rh+rg));
+      const rowEnds=[];  // rightmost pixel of last read placed in each row
+      for (const [rStart, rEnd] of actualReads) {
+        const px1=Math.max(0, ((rStart-vs)*scaleX)|0);
+        const px2=Math.min(W, Math.max(px1+1, ((rEnd-vs)*scaleX+0.5)|0));
+        if (px2<=0 || px1>=W) continue;
+        let row=0;
+        while (row<rowEnds.length && rowEnds[row]>px1) row++;
+        if (row>=maxRows) continue;
+        rowEnds[row]=px2;
+        const ry=isPlus ? yBase+trackH-4-row*(rh+rg) : yBase+3+row*(rh+rg);
+        if (isPlus && ry<yBase+2) continue;
+        if (!isPlus && ry+rh>yBase+trackH-2) continue;
+        out.push(`<rect x="${px1}" y="${ry}" width="${px2-px1}" height="${rh}" fill="${col}" opacity="0.8" rx="0.5"/>`);
+      }
+    } else {
+      // Fallback: simulate reads from bin coverage counts
+      const rh=2, rg=1, maxR=Math.floor((trackH-6)/(rh+rg));
+      function lcg(s) { return (Math.imul(s,1664525)+1013904223)|0; }
+      for (let i=0; i<vd.length; i++) {
+        if (!vd[i]) continue;
+        const fx1=bx1(i), fx2=bx2(i);
+        const px1=Math.max(0,fx1|0), px2=Math.min(W,(fx2+0.5)|0);
+        if (px2<=px1) continue;
+        const bw=px2-px1;
+        const rw=Math.max(2, Math.min(18, (bw*0.38)|0));
+        let seed=(firstBin+i)*(isPlus?12345:67890);
+        for (let r=0; r<Math.min(maxR,vd[i]); r++) {
+          seed=lcg(seed);
+          const room=Math.max(0,bw-rw-2);
+          const rx=px1+1+(room>0 ? (((seed>>8)&0xff)/256*room)|0 : 0);
+          if (rx+rw>px2) continue;
+          const ry=isPlus ? yBase+trackH-4-r*(rh+rg) : yBase+3+r*(rh+rg);
+          if (isPlus && ry<yBase+2) break;
+          if (!isPlus && ry+rh>yBase+trackH-2) break;
           out.push(`<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${col}" opacity="0.65" rx="0.5"/>`);
         }
       }

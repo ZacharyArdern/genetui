@@ -18,7 +18,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::process::Command as TokioCommand;
 
 use app::{App, PlasmidData};
-use core::{compute_alignment_coverage, compute_gc_skew, find_stop_codons, parse_fasta, parse_gff, reverse_complement_str, translate};
+use core::{compute_alignment_coverage, ensure_bam_index, fetch_reads_in_region, compute_gc_skew, find_stop_codons, parse_fasta, parse_gff, reverse_complement_str, translate};
 
 #[derive(Parser, Debug)]
 #[command(name = "genetui", about = "Terminal genome browser")]
@@ -107,7 +107,7 @@ fn classify_files(cli: &Cli) -> (Option<String>, Option<String>, Option<String>)
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (fasta_path, gff_path, bam_path) = classify_files(&cli);
+    let (fasta_path, gff_path, mut bam_path) = classify_files(&cli);
     let gff_path = gff_path.ok_or_else(|| anyhow::anyhow!("No GFF/GFF3 file provided"))?;
 
     // Build fold command: prefer --minifold_mlx path, fall back to `minifold` in PATH.
@@ -183,6 +183,14 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    // Ensure BAM is sorted+indexed; may return a different (sorted) path.
+    if let Some(ref bp) = bam_path {
+        match ensure_bam_index(bp) {
+            Ok(actual) => { bam_path = Some(actual); }
+            Err(e)     => { eprintln!("Warning: could not build BAM index: {e}"); }
+        }
+    }
+
     let coverage = if let Some(ref bam_path) = bam_path {
         match compute_alignment_coverage(bam_path, fasta_path.as_deref(), &seqname_offsets, genome_size) {
             Ok(cov) => Some(cov),
@@ -222,6 +230,8 @@ async fn main() -> Result<()> {
     let famsa_bin = find_famsa(cli.famsa.clone());
 
     let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);
+    app.bam_path = bam_path.clone();
+    app.seqname_offsets = seqname_offsets.clone();
     app.fold_predict_py = use_predict_py && app.on_click_cmd.is_some();
     app.basic_mode = cli.basic;
     if cli.basic {
@@ -399,6 +409,7 @@ async fn run_loop(
             } else {
                 app.set_status(format!("fold: gene '{}' not found", gene_name));
             }
+            push_browser_state(app, web);
         }
 
         // Apply switch_genome commands from browser
@@ -446,6 +457,44 @@ async fn run_loop(
             } else {
                 app.set_status(format!("msa: gene '{}' not found", gene_name));
             }
+            push_browser_state(app, web);
+        }
+
+        // Handle browser: set DIAMOND DB path
+        if let Some(path) = web.take_set_dmnd_cmd() {
+            let expanded = if path.starts_with("~/") {
+                format!("{}{}", std::env::var("HOME").unwrap_or_default(), &path[1..])
+            } else { path.clone() };
+            app.dmnd_db = Some(expanded);
+            app.needs_dmnd_db = false;
+            app.path_completions.clear();
+            app.set_status(format!("DIAMOND database set: {}", path));
+            if let Some(gene_name) = app.pending_msa_gene.take() {
+                let feat_opt = app.active_features().iter().find(|f| f.name == gene_name || f.locus_tag == gene_name).cloned();
+                if let Some(feat) = feat_opt {
+                    let seq_source = if app.active_genome > 0 {
+                        app.plasmids.get(app.active_genome - 1).map(|p| p.sequence.clone())
+                    } else { app.genome_seq.clone() };
+                    if let Some(seq) = seq_source {
+                        let start_idx = (feat.start as usize).saturating_sub(1);
+                        let end_idx = (feat.end as usize).min(seq.len());
+                        let raw = &seq[start_idx..end_idx];
+                        let nt_seq = if feat.strand == '-' {
+                            crate::core::reverse_complement_str(raw).to_uppercase()
+                        } else { raw.to_uppercase() };
+                        let aa_seq = translate(&nt_seq);
+                        app.open_protein_panel(feat.name.clone(), nt_seq, aa_seq);
+                        start_msa_search(app, &mut msa_rx).await;
+                    }
+                }
+            }
+            push_browser_state(app, web);
+        }
+
+        // Handle browser: path tab-completion request
+        if let Some(prefix) = web.take_complete_path_cmd() {
+            app.path_completions = blast_completions(&prefix);
+            push_browser_state(app, web);
         }
 
         // Render protein image before draw so the frame is never blank.
@@ -792,6 +841,17 @@ async fn run_loop(
                             } else {
                                 app.active_panel = crate::app::ActivePanel::Genome;
                             }
+                            // Track minimap drag start
+                            if rect_contains(&app.minimap_rect, r, c) {
+                                app.minimap_dragging = true;
+                                app.plasmid_drag_idx = None;
+                            } else {
+                                let pi = app.plasmid_rects.iter().enumerate()
+                                    .find(|(_, rect)| rect_contains(rect, r, c))
+                                    .map(|(i, _)| i);
+                                app.plasmid_drag_idx = pi;
+                                app.minimap_dragging = pi.is_none();
+                            }
                             handle_hover(app, row as usize, col as usize);
                             if handle_click(app, row as usize, col as usize).await {
                                 fold_rx = None;
@@ -811,6 +871,32 @@ async fn run_loop(
                                         panel.img_cache = None;
                                     }
                                 }
+                            } else if app.minimap_dragging {
+                                let genome_size = app.genome_size;
+                                app.switch_genome(0);
+                                if let Some(pos) = minimap_click_pos(app.minimap_rect, row as usize, col as usize, genome_size) {
+                                    let cur_span = app.view_end.saturating_sub(app.view_start).max(1);
+                                    let half = cur_span / 2;
+                                    let start = pos.saturating_sub(half);
+                                    let end = (start + cur_span).min(genome_size);
+                                    app.goto(start, end);
+                                    push_browser_state(app, web);
+                                }
+                            } else if let Some(pi) = app.plasmid_drag_idx {
+                                if let Some(psize) = app.plasmids.get(pi).map(|p| p.genome_size) {
+                                    let rect = app.plasmid_rects.get(pi).copied().unwrap_or_default();
+                                    app.switch_genome(pi + 1);
+                                    if let Some(pos) = minimap_click_pos(rect, row as usize, col as usize, psize) {
+                                        let cur_span = app.plasmids.get(pi)
+                                            .map(|p| p.view_end.saturating_sub(p.view_start).max(1))
+                                            .unwrap_or(psize);
+                                        let half = cur_span / 2;
+                                        let start = pos.saturating_sub(half);
+                                        let end = (start + cur_span).min(psize);
+                                        app.goto_active(start, end);
+                                        push_browser_state(app, web);
+                                    }
+                                }
                             }
                             handle_hover(app, row as usize, col as usize);
                         }
@@ -818,6 +904,8 @@ async fn run_loop(
                             if let Some(ref mut panel) = app.protein {
                                 panel.drag_last = None;
                             }
+                            app.minimap_dragging = false;
+                            app.plasmid_drag_idx = None;
                             handle_hover(app, row as usize, col as usize);
                         }
                         _ => {
@@ -941,7 +1029,12 @@ async fn start_msa_search(
     };
     let dmnd_db = match app.dmnd_db.clone() {
         Some(db) => db,
-        None => { app.set_status("No DIAMOND db specified — use --dmnd <path.dmnd>"); return; }
+        None => {
+            app.set_status("No DIAMOND database — specify path below");
+            app.needs_dmnd_db = true;
+            app.pending_msa_gene = app.protein.as_ref().map(|p| p.gene_name.clone());
+            return;
+        }
     };
     let famsa_bin = match app.famsa_bin.clone() {
         Some(b) => b,
@@ -1497,6 +1590,25 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         .map(|p| (p.pdb_raw.clone(), p.gene_name.clone()))
         .unwrap_or_default();
 
+    // Per-read data: fetch from indexed BAM when viewport is narrow enough
+    const READ_FETCH_BP: u64 = 50_000;
+    let (reads_p, reads_m) = if app.active_genome == 0 {
+        if let Some(ref bam) = app.bam_path {
+            let vs = app.active_view_start();
+            let ve = app.active_view_end();
+            if ve.saturating_sub(vs) <= READ_FETCH_BP {
+                match fetch_reads_in_region(bam, &app.seqname_offsets, vs, ve, 8000) {
+                    Ok(rds) => {
+                        let rp = rds.iter().filter(|r| !r.2).map(|r| [r.0, r.1]).collect();
+                        let rm = rds.iter().filter(|r|  r.2).map(|r| [r.0, r.1]).collect();
+                        (rp, rm)
+                    }
+                    Err(_) => (vec![], vec![]),
+                }
+            } else { (vec![], vec![]) }
+        } else { (vec![], vec![]) }
+    } else { (vec![], vec![]) };
+
     // Coverage: send viewport-context bins for chromosome only
     let (cov_plus, cov_minus, cov_bin_sz, cov_bin_start) =
         if app.active_genome == 0 {
@@ -1534,7 +1646,9 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         };
         (slice_for('+'), slice_for('-'))
     } else {
-        (vec![vec![], vec![], vec![]], vec![vec![], vec![], vec![]])
+        // Empty outer vec (length 0) signals JS to use client-side fallback scan.
+        // vec![[],[],[]] has length 3 which the JS check misreads as valid server data.
+        (vec![], vec![])
     };
 
     web.push(server::BrowserState {
@@ -1557,6 +1671,8 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         coverage_minus:     cov_minus,
         coverage_bin_size:  cov_bin_sz,
         coverage_bin_start: cov_bin_start,
+        reads_plus:  reads_p,
+        reads_minus: reads_m,
         gc_skew: vec![],  // redundant with main_gc_skew/plasmid_gc_skew; kept for compatibility
         input_files: app.source_files.clone(),
         msa_gene: app.msa.as_ref()
@@ -1567,13 +1683,19 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
             .filter(|m| !m.loading && m.error.is_none())
             .map(|m| m.sequences.iter().map(|(id, seq)| [id.clone(), seq.clone()]).collect())
             .unwrap_or_default(),
+        msa_error: app.msa.as_ref()
+            .filter(|m| !m.loading)
+            .and_then(|m| m.error.clone())
+            .unwrap_or_default(),
         status_msg: if app.protein.as_ref().map(|p| p.folding).unwrap_or(false) {
             "Folding protein\u{2026}".into()
         } else if app.msa.as_ref().map(|m| m.loading).unwrap_or(false) {
             "Building MSA\u{2026}".into()
         } else {
-            String::new()
+            app.status_msg.clone()
         },
+        needs_dmnd_db: app.needs_dmnd_db,
+        path_completions: app.path_completions.clone(),
         active_genome: app.active_genome,
         main_name:     app.genome_name.clone(),
         main_size:     app.genome_size,
@@ -1592,11 +1714,35 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
                 start:     f.start,
                 end:       f.end,
                 strand:    f.strand,
-                color:     "#e6b800".to_string(),
+                color:     "#e040fb".to_string(),
                 noncoding: false,
                 is_orf:    false,
             }
         }).collect(),
+        contig_names:  {
+            let mut sv: Vec<(&String, &u64)> = app.seqname_offsets.iter().collect();
+            sv.sort_by_key(|(_, &off)| off);
+            sv.iter().map(|(n, _)| (*n).clone()).collect()
+        },
+        contig_starts: {
+            let mut sv: Vec<(&String, &u64)> = app.seqname_offsets.iter().collect();
+            sv.sort_by_key(|(_, &off)| off);
+            sv.iter().map(|(_, &off)| off).collect()
+        },
+        contig_ends: {
+            let mut sv: Vec<(&String, &u64)> = app.seqname_offsets.iter().collect();
+            sv.sort_by_key(|(_, &off)| off);
+            let mut ends = Vec::with_capacity(sv.len());
+            for i in 0..sv.len() {
+                if i + 1 < sv.len() {
+                    // gap = 20k Ns before each subsequent contig
+                    ends.push(sv[i + 1].1.saturating_sub(20_000));
+                } else {
+                    ends.push(app.genome_size);
+                }
+            }
+            ends
+        },
     });
 }
 

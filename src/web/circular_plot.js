@@ -17,6 +17,22 @@ let circLastFetchKey  = null;
 let circDebounceTimer = null;
 let circDragState     = null;  // active drag of "you are here" arc
 let circDragMoved     = false; // suppress click after drag
+let circZoom          = 0.65;  // fraction of panel width; wheel zooms this
+
+function applyCircZoom() {
+  document.querySelectorAll('.circ-map-item svg').forEach(svg => {
+    svg.style.width  = Math.round(circZoom * 100) + '%';
+    svg.style.height = 'auto';
+  });
+}
+
+// ── Wheel zoom on circle panel ────────────────────────────────────────────────
+document.getElementById('circ-body').addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.92 : 1 / 0.92;
+  circZoom = Math.max(0.25, Math.min(1.5, circZoom * factor));
+  applyCircZoom();
+}, { passive: false });
 
 function setCircStatus(msg){const el=document.getElementById('circ-status');if(el)el.textContent=msg;}
 function circOpt(id){return document.getElementById(id);}
@@ -73,7 +89,7 @@ async function fetchAllCircMaps() {
     if (svgEl) {
       svgEl.removeAttribute('width');
       svgEl.removeAttribute('height');
-      svgEl.style.cssText = 'width:min(100%,calc(100vh - 160px));height:auto;display:block;margin:0 auto;';
+      svgEl.style.cssText = `width:${Math.round(circZoom*100)}%;height:auto;display:block;margin:0 auto;`;
 
       // Title double-click → focus options
       const titleEl = svgEl.getElementById('circ-title-svg');
@@ -210,7 +226,7 @@ function drawViewportMarker() {
       pt.x = e.clientX; pt.y = e.clientY;
       const sp = pt.matrixTransform(svgEl.getScreenCTM().inverse());
       const startAngle = Math.atan2(sp.y - cy, sp.x - cx);
-      circDragState = { svgEl, cx, cy, gsize, startAngle, startVS: vs, startVE: ve };
+      circDragState = { svgEl, cx, cy, gsize, rInner, startAngle, startVS: vs, startVE: ve };
       circDragMoved = false;
       e.preventDefault();
     });
@@ -235,11 +251,17 @@ function drawViewportMarker() {
 // ── Drag "you are here" arc ───────────────────────────────────────────────────
 document.addEventListener('mousemove', e => {
   if (!circDragState) return;
-  const { svgEl, cx, cy, gsize, startAngle, startVS, startVE } = circDragState;
+  const { svgEl, cx, cy, gsize, rInner, startAngle, startVS, startVE } = circDragState;
   const pt = svgEl.createSVGPoint();
   pt.x = e.clientX; pt.y = e.clientY;
   const sp = pt.matrixTransform(svgEl.getScreenCTM().inverse());
-  let delta = Math.atan2(sp.y - cy, sp.x - cx) - startAngle;
+  // Project cursor onto ring if inside inner radius to prevent degenerate arcs
+  const dx = sp.x - cx, dy = sp.y - cy;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+  const safeR = Math.max(dist, rInner * 1.1);
+  const px = cx + dx * safeR / dist;
+  const py = cy + dy * safeR / dist;
+  let delta = Math.atan2(py - cy, px - cx) - startAngle;
   // Normalise to -π..π
   if (delta > Math.PI) delta -= 2*Math.PI;
   if (delta < -Math.PI) delta += 2*Math.PI;
@@ -316,6 +338,12 @@ document.getElementById('circ-show-viewport').addEventListener('change',()=>draw
 })();
 document.getElementById('btn-circ-render').addEventListener('click',()=>fetchAllCircMaps());
 document.getElementById('btn-circ-png').addEventListener('click',()=>downloadCircPng());
+document.getElementById('btn-circ-zoom-in').addEventListener('click',()=>{
+  circZoom=Math.min(1.5,circZoom*1.15); applyCircZoom();
+});
+document.getElementById('btn-circ-zoom-out').addEventListener('click',()=>{
+  circZoom=Math.max(0.25,circZoom/1.15); applyCircZoom();
+});
 
 // ── Hooks called from websocket.js / panels.js ────────────────────────────────
 function onCircStateUpdate() {

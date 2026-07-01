@@ -81,6 +81,8 @@ pub struct App {
     pub plasmids: Vec<PlasmidData>,
     pub active_genome: usize,
     pub minimap_rect: Rect,
+    pub minimap_dragging: bool,
+    pub plasmid_drag_idx: Option<usize>,
     pub legend_rect: Rect,
     pub plasmid_rects: Vec<Rect>,
     /// Which circle map is currently hovered: 0 = chromosome, 1+ = plasmid index+1, None = none
@@ -124,6 +126,12 @@ pub struct App {
     pub blast_running: bool,
     pub blast_error: Option<String>,
     pub blast_features: Vec<crate::core::Feature>,
+    /// Set when MSA is triggered from browser but no DIAMOND DB is configured.
+    pub needs_dmnd_db: bool,
+    /// Gene waiting for MSA once a DB path is provided.
+    pub pending_msa_gene: Option<String>,
+    /// Path completions sent to browser for DB picker.
+    pub path_completions: Vec<String>,
     /// Incremented each tick; used by the UI for spinner animation.
     pub anim_tick: u64,
     /// Set to true to request a full terminal clear on the next frame (clears external writes).
@@ -142,6 +150,10 @@ pub struct App {
     pub pending_kitty: Option<Vec<u8>>,
     /// Set to true when img_cache changes so pending_kitty gets rebuilt.
     pub kitty_image_dirty: bool,
+    /// Path to BAM file (for per-viewport read fetching via IndexedReader).
+    pub bam_path: Option<String>,
+    /// Sequence name → global offset map (used for multi-contig BAM queries).
+    pub seqname_offsets: HashMap<String, u64>,
 }
 
 impl App {
@@ -178,6 +190,8 @@ impl App {
             plasmids,
             active_genome: 0,
             minimap_rect: Rect::default(),
+            minimap_dragging: false,
+            plasmid_drag_idx: None,
             legend_rect: Rect::default(),
             plasmid_rects: Vec::new(),
             hovered_map: None,
@@ -214,6 +228,9 @@ impl App {
             blast_running: false,
             blast_error: None,
             blast_features: Vec::new(),
+            needs_dmnd_db: false,
+            pending_msa_gene: None,
+            path_completions: Vec::new(),
             anim_tick: 0,
             needs_clear: false,
             source_files: Vec::new(),
@@ -224,6 +241,8 @@ impl App {
                 || std::env::var("TERM_PROGRAM").map(|t| t == "ghostty").unwrap_or(false),
             pending_kitty: None,
             kitty_image_dirty: false,
+            bam_path: None,
+            seqname_offsets: HashMap::new(),
         }
     }
 

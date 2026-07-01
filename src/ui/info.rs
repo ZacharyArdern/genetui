@@ -16,7 +16,8 @@ pub(super) fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
     let shortcuts = Line::from(vec![
         Span::styled(" /:search  ", Style::default().fg(Color::White).bg(bg)),
         Span::styled("d:menu  ", Style::default().fg(Color::White).bg(bg)),
-        Span::styled("w:browser app", Style::default().fg(Color::White).bg(bg)),
+        Span::styled("w:browser app  ", Style::default().fg(Color::White).bg(bg)),
+        Span::styled("q:quit", Style::default().fg(Color::White).bg(bg)),
     ]);
 
     let lines = if let Some(idx) = app.hovered {

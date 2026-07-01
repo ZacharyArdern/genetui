@@ -1,5 +1,27 @@
-// ── Panel focus tracking (set by msa_panel.js, gene_info.js, etc.) ───────────
+// ── Panel focus tracking ──────────────────────────────────────────────────────
 window.hoveredPanel = 'genome';
+window.focusedPanel = 'genome';
+
+(function() {
+  const panelIds = ['live-panel','circ-panel','fig-panel','struct-panel','msa-panel','circ-body'];
+  function setFocus(id) {
+    window.focusedPanel = id;
+    ['live-panel','circ-panel','fig-panel','struct-panel','msa-panel'].forEach(pid => {
+      const el = document.getElementById(pid);
+      if (el) el.classList.toggle('panel-focused', pid === id);
+    });
+  }
+  panelIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('mousedown', () => {
+      const canonical = id === 'circ-body' ? 'circ-panel' : id;
+      setFocus(canonical);
+    });
+  });
+  // Default focus on genome track
+  setFocus('live-panel');
+})();
 
 // ── Local viewport helpers ────────────────────────────────────────────────────
 function renderLocal() {
@@ -109,8 +131,12 @@ document.addEventListener('keydown', e => {
   if (window.hoveredPanel && window.hoveredPanel !== 'genome') return;
   if (e.key === '/') {
     e.preventDefault();
-    const inp = document.getElementById('browser-search');
-    if (inp) { inp.focus(); inp.select(); }
+    openSearchOverlay();
+    return;
+  }
+  if (e.key === 'q' || e.key === 'Q') {
+    e.preventDefault();
+    window.close();
     return;
   }
   const span=localVE-localVS, step=Math.max(1,Math.round(span*.12));
@@ -132,12 +158,31 @@ document.addEventListener('keydown', e => {
 
 window.addEventListener('resize', renderLocal);
 
-// ── Browser gene / coordinate search ─────────────────────────────────────────
+// ── Browser gene / coordinate search (overlay, opened by /) ──────────────────
 (function() {
-  const inp = document.getElementById('browser-search');
-  const btn = document.getElementById('btn-browser-search');
-  const res = document.getElementById('browser-search-results');
+  const overlay = document.getElementById('search-overlay');
+  const inp     = document.getElementById('browser-search');
+  const res     = document.getElementById('browser-search-results');
   let searchHits = [], searchIdx = 0;
+
+  function closeSearch() {
+    overlay.style.display='none';
+    res.style.display='none';
+    inp.value='';
+    searchHits=[];
+    window.hoveredPanel='genome';
+  }
+
+  window.openSearchOverlay = function() {
+    overlay.style.display='flex';
+    inp.focus(); inp.select();
+    window.hoveredPanel='search';
+  };
+
+  // Click outside the inner box closes overlay
+  overlay.addEventListener('mousedown', e => {
+    if (e.target===overlay) closeSearch();
+  });
 
   function allSearchFeats() {
     if (!lastState) return [];
@@ -162,45 +207,32 @@ window.addEventListener('resize', renderLocal);
     enterLocalMode();
   }
 
-  function showDropdown(hits) {
-    searchHits = hits;
-    searchIdx  = 0;
-    if (!hits.length) { res.style.display='none'; return; }
-    const rect = inp.getBoundingClientRect();
-    res.style.left  = rect.left + 'px';
-    res.style.top   = (rect.bottom + 2) + 'px';
-    res.style.display = 'block';
-    renderDropdown();
-  }
-
   function renderDropdown() {
     res.innerHTML = searchHits.map((f, i) => {
       const bg = i === searchIdx ? '#1f6feb' : 'transparent';
       const locus = f.locus_tag && f.locus_tag !== f.name ? ` <span style="color:#6e7681">${esc(f.locus_tag)}</span>` : '';
-      return `<div data-i="${i}" style="padding:3px 10px;cursor:pointer;background:${bg};color:#c9d1d9">
+      return `<div data-i="${i}" style="padding:4px 10px;cursor:pointer;background:${bg};color:#c9d1d9">
         <span style="color:#58a6ff">${esc(f.name)}</span>${locus}
         <span style="color:#484f58;float:right">${fmt(f.start)}</span></div>`;
     }).join('');
     res.querySelectorAll('[data-i]').forEach(el => {
       el.addEventListener('mousedown', e => {
         e.preventDefault();
-        const i = parseInt(el.dataset.i);
-        navigateTo(searchHits[i]);
-        res.style.display='none';
-        inp.value='';
+        navigateTo(searchHits[parseInt(el.dataset.i)]);
+        closeSearch();
       });
     });
   }
 
   function doSearch(commit) {
     const q = inp.value.trim();
-    if (!q) { res.style.display='none'; return; }
+    if (!q) { res.style.display='none'; searchHits=[]; return; }
     const coord = parseCoord(q);
     if (coord) {
       if (commit) {
         localVS=coord[0]; localVE=coord[1];
         clampLocal(); renderLocal(); sendViewport(); enterLocalMode();
-        res.style.display='none'; inp.value=''; inp.blur();
+        closeSearch();
       }
       return;
     }
@@ -208,29 +240,29 @@ window.addEventListener('resize', renderLocal);
     const feats = allSearchFeats();
     const exact  = feats.filter(f => f.name.toLowerCase()===ql || (f.locus_tag||'').toLowerCase()===ql);
     const prefix = feats.filter(f => !exact.includes(f) && (f.name.toLowerCase().startsWith(ql) || (f.locus_tag||'').toLowerCase().startsWith(ql)));
-    const hits = [...exact, ...prefix].slice(0, 20);
-    if (commit && hits.length > 0) {
-      navigateTo(hits[0]);
-      res.style.display='none'; inp.value=''; inp.blur();
+    searchHits = [...exact, ...prefix].slice(0, 20);
+    searchIdx  = 0;
+    if (commit && searchHits.length > 0) {
+      navigateTo(searchHits[0]);
+      closeSearch();
+    } else if (searchHits.length) {
+      res.style.display='block';
+      renderDropdown();
     } else {
-      showDropdown(hits);
+      res.style.display='none';
     }
   }
 
   inp.addEventListener('input', () => doSearch(false));
   inp.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); doSearch(true); }
-    else if (e.key === 'Escape') { res.style.display='none'; inp.blur(); }
+    else if (e.key === 'Escape') { closeSearch(); }
     else if (e.key === 'ArrowDown' && searchHits.length) {
       searchIdx = Math.min(searchIdx+1, searchHits.length-1); renderDropdown(); e.preventDefault();
     } else if (e.key === 'ArrowUp' && searchHits.length) {
       searchIdx = Math.max(searchIdx-1, 0); renderDropdown(); e.preventDefault();
     }
   });
-  inp.addEventListener('focus', () => { window.hoveredPanel='search'; });
-  inp.addEventListener('blur',  () => { setTimeout(()=>{ res.style.display='none'; window.hoveredPanel='genome'; },150); });
-  btn.addEventListener('click', () => doSearch(true));
-  document.getElementById('browser-search-form').addEventListener('submit', () => doSearch(true));
 })();
 
 // ── Vertical drag-resize (live-panel height) ──────────────────────────────────

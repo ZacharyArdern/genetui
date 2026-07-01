@@ -33,13 +33,19 @@ jobs:
       - name: Install htslib (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo add-apt-repository universe -y
           sudo apt-get update
           sudo apt-get install -y \
-            libhtslib-dev pkg-config \
-            libbz2-dev liblzma-dev \
-            libcurl4-openssl-dev libssl-dev \
-            zlib1g-dev
+            pkg-config libbz2-dev liblzma-dev \
+            libcurl4-openssl-dev libssl-dev zlib1g-dev
+          # Build htslib from source — libhtslib-dev is not reliably available on ubuntu-24.04
+          curl -fsSL https://github.com/samtools/htslib/releases/download/1.21/htslib-1.21.tar.bz2 \
+            | tar -xj
+          cd htslib-1.21
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

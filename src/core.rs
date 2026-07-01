@@ -215,8 +215,8 @@ pub fn parse_fasta(path: &str) -> Result<ParsedFasta> {
         });
     }
 
-    // Multiple entries: concatenate with 10 kb N gaps
-    const GAP: usize = 10_000;
+    // Multiple entries: concatenate with 20 kb N gaps
+    const GAP: usize = 20_000;
     let gap_str = "N".repeat(GAP);
 
     let mut main_seq = String::new();
@@ -443,6 +443,120 @@ pub struct StrandCoverage {
     pub genome_size: u64,
 }
 
+
+/// Build a BAM index (.bai) if one does not already exist alongside the BAM.
+/// Ensure an indexed BAM exists and return the path to use.
+/// If the BAM is unsorted, sorts it first (creating a .sorted.bam beside it).
+/// Returns the path that should actually be opened (may differ from input).
+pub fn ensure_bam_index(bam_path: &str) -> Result<String> {
+    let bai = format!("{}.bai", bam_path);
+    let csi = format!("{}.csi", bam_path);
+    if std::path::Path::new(&bai).exists() || std::path::Path::new(&csi).exists() {
+        return Ok(bam_path.to_string());
+    }
+
+    eprintln!("Building BAM index for {} ...", bam_path);
+
+    // Try indexing directly (works if BAM is already sorted)
+    let indexed = std::process::Command::new("samtools")
+        .args(["index", bam_path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if indexed && (std::path::Path::new(&bai).exists() || std::path::Path::new(&csi).exists()) {
+        eprintln!("BAM index built.");
+        return Ok(bam_path.to_string());
+    }
+
+    // BAM is likely unsorted — sort first, then index
+    let sorted_path = if bam_path.ends_with(".bam") {
+        format!("{}.sorted.bam", &bam_path[..bam_path.len()-4])
+    } else {
+        format!("{}.sorted.bam", bam_path)
+    };
+
+    if !std::path::Path::new(&sorted_path).exists() {
+        eprintln!("BAM appears unsorted, sorting to {} ...", sorted_path);
+        let ok = std::process::Command::new("samtools")
+            .args(["sort", "-o", &sorted_path, bam_path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            anyhow::bail!("samtools sort failed for {}", bam_path);
+        }
+        eprintln!("BAM sorted.");
+    }
+
+    let sorted_bai = format!("{}.bai", sorted_path);
+    let sorted_csi = format!("{}.csi", sorted_path);
+    if !std::path::Path::new(&sorted_bai).exists() && !std::path::Path::new(&sorted_csi).exists() {
+        let ok = std::process::Command::new("samtools")
+            .args(["index", &sorted_path])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            anyhow::bail!("samtools index failed for {}", sorted_path);
+        }
+        eprintln!("Sorted BAM indexed.");
+    }
+
+    Ok(sorted_path)
+}
+
+/// Fetch individual reads overlapping [vs, ve) from an indexed BAM.
+/// Returns (global_start, global_end, is_reverse) tuples sorted by start, capped at max_reads.
+pub fn fetch_reads_in_region(
+    bam_path: &str,
+    seqname_offsets: &HashMap<String, u64>,
+    vs: u64,
+    ve: u64,
+    max_reads: usize,
+) -> Result<Vec<(u32, u32, bool)>> {
+    use rust_htslib::bam::{IndexedReader, Read};
+    // Avoid htslib printing "could not retrieve index file" to stderr
+    let bai = format!("{}.bai", bam_path);
+    let csi = format!("{}.csi", bam_path);
+    if !std::path::Path::new(&bai).exists() && !std::path::Path::new(&csi).exists() {
+        return Ok(vec![]);
+    }
+    let mut reader = IndexedReader::from_path(bam_path)
+        .map_err(|e| anyhow::anyhow!("IndexedReader: {}", e))?;
+    let header = rust_htslib::bam::Header::from_template(reader.header());
+    let hview  = rust_htslib::bam::HeaderView::from_header(&header);
+    let n_refs  = hview.target_count() as usize;
+
+    let ref_offsets: Vec<Option<u64>> = (0..n_refs).map(|i| {
+        let name = std::str::from_utf8(hview.tid2name(i as u32)).ok()?;
+        if seqname_offsets.is_empty() { Some(0u64) }
+        else { seqname_offsets.get(name).copied() }
+    }).collect();
+
+    let mut reads: Vec<(u32, u32, bool)> = Vec::new();
+
+    for (tid, off_opt) in ref_offsets.iter().enumerate() {
+        let offset = match off_opt { Some(o) => *o, None => continue };
+        let local_s = if vs > offset { (vs - offset) as i64 } else { 0i64 };
+        let local_e = if ve > offset { (ve - offset) as i64 } else { continue };
+        if local_e <= local_s { continue; }
+        let _ = reader.fetch((tid as u32, local_s, local_e));
+        for result in reader.records() {
+            if reads.len() >= max_reads { break; }
+            let rec = match result { Ok(r) => r, Err(_) => continue };
+            if rec.is_unmapped() || rec.is_secondary() || rec.is_supplementary() { continue; }
+            let pos = rec.pos(); if pos < 0 { continue; }
+            let gs = offset + pos as u64;
+            let ge = gs + rec.seq_len() as u64;
+            if ge < vs || gs >= ve { continue; }
+            reads.push((gs as u32, ge as u32, rec.is_reverse()));
+        }
+        if reads.len() >= max_reads { break; }
+    }
+    reads.sort_by_key(|r| r.0);
+    Ok(reads)
+}
 
 /// Compute BAM/SAM/CRAM coverage using rust-htslib (htslib C bindings).
 pub fn compute_alignment_coverage(

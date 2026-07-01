@@ -62,6 +62,19 @@ document.getElementById('fig-hide-long-labels').addEventListener('change', funct
 document.getElementById('cov-style-fig').addEventListener('change', function(){
   scheduleAutoRender();
 });
+document.getElementById('cov-style-svg').addEventListener('change', function(){
+  const hr = document.getElementById('cov-height-row');
+  if (hr) hr.style.display = this.value !== 'none' ? '' : 'none';
+  renderLocal();
+});
+document.getElementById('cov-height').addEventListener('input', function(){
+  const lbl = document.getElementById('lbl-cov-height');
+  if (lbl) lbl.textContent = this.value;
+  renderLocal();
+});
+document.getElementById('opt-codons').addEventListener('input', function(){
+  renderLocal();
+});
 
 // ── Panel selector (d key) ────────────────────────────────────────────────────
 (function(){
@@ -116,40 +129,6 @@ document.getElementById('cov-style-fig').addEventListener('change', function(){
     row.append(cb,lbl); box.appendChild(row);
   });
 
-  // Coverage style row (live SVG track only)
-  const covSep = document.createElement('div');
-  covSep.style.cssText='border-top:1px solid #21262d;margin:10px 0 8px;';
-  box.appendChild(covSep);
-  const covRow = document.createElement('div');
-  covRow.style.cssText='display:flex;align-items:center;gap:8px;font-size:12px;color:#c9d1d9;';
-  const covLbl = document.createElement('span'); covLbl.textContent='Coverage (live)';
-  covLbl.style.cssText='min-width:80px;color:#8b949e;';
-  const covSel = document.createElement('select');
-  covSel.id = 'cov-style-svg';
-  covSel.style.cssText='background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 4px;font-size:11px;';
-  [['none','None'],['histogram','Histogram'],['kernel','Kernel'],['reads','Raw reads']].forEach(([v,l])=>{
-    const o=document.createElement('option'); o.value=v; o.textContent=l; covSel.appendChild(o);
-  });
-  const covHRow = document.createElement('div');
-  covHRow.id='cov-height-row';
-  covHRow.style.cssText='display:none;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;margin-top:6px;';
-  const covHLbl = document.createElement('span'); covHLbl.textContent='Height';
-  covHLbl.style.cssText='min-width:80px;color:#8b949e;';
-  const covHIn = document.createElement('input');
-  covHIn.type='range'; covHIn.id='cov-height'; covHIn.min=30; covHIn.max=150; covHIn.step=5; covHIn.value=70;
-  covHIn.style.cssText='width:90px;';
-  const covHVal = document.createElement('span'); covHVal.id='lbl-cov-height'; covHVal.textContent='70';
-  covHVal.style.cssText='min-width:24px;font-size:11px;color:#8b949e;';
-  covHRow.append(covHLbl, covHIn, covHVal, Object.assign(document.createElement('span'),{textContent:'px',style:'font-size:10px;color:#8b949e;'}));
-  covSel.addEventListener('change', ()=>{
-    covHRow.style.display = covSel.value !== 'none' ? 'flex' : 'none';
-    renderLocal();
-  });
-  covHIn.addEventListener('input', ()=>{
-    covHVal.textContent = covHIn.value;
-    renderLocal();
-  });
-  covRow.append(covLbl, covSel); box.appendChild(covRow); box.appendChild(covHRow);
 
   ov.appendChild(box); document.body.appendChild(ov);
   window._panelCbs=panelCbs;

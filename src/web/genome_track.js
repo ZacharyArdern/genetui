@@ -30,6 +30,13 @@ function getStopSet() {
 }
 function translateCodon(c) { return AA_TABLE[c.toUpperCase()] || '?'; }
 
+const CODON_HL_COL = '#3fb950'; // green
+function getCodonHighlightSet() {
+  const el = document.getElementById('opt-codons');
+  if (!el || !el.value.trim()) return new Set();
+  return new Set(el.value.toUpperCase().split(/[,\s]+/).map(s=>s.trim()).filter(s=>s.length===3));
+}
+
 let lastState = null, localVS = 0, localVE = 0;
 let localMode = false, localModeTimer = null;
 let pyodide = null, pyReady = false, pyRendering = false;
@@ -103,7 +110,7 @@ function drawSVG(state, vs, ve) {
   const H = panel.clientHeight || 300;
   const {genome_size, genome_name, sequence='', seq_start: seqOff=0} = state;
   // Merge blast hits (yellow) into the feature list — overlaid in same gene track row
-  const blastFeats = (state.blast_features || []).map(bf => ({...bf, color: '#e6b800'}));
+  const blastFeats = (state.blast_features || []).map(bf => ({...bf, color: '#e040fb'}));
   const features = [...(state.features || []), ...blastFeats];
   const span  = Math.max(ve-vs,1), scale = W/span;
   const sixFrame = document.getElementById('opt-sixframe').checked;
@@ -112,19 +119,63 @@ function drawSVG(state, vs, ve) {
   const covH = (covStyle !== 'none' && hasCovData)
     ? parseInt(document.getElementById('cov-height').value) : 0;
 
+  // Contig boundary helpers
+  const contigs = (state.contig_names||[]).map((n,i)=>({
+    name: n, start: state.contig_starts[i], end: state.contig_ends[i]
+  }));
+  const multiContig = contigs.length > 1;
+  function posLabel(pos) {
+    if (!multiContig) return fmt(pos);
+    for (const c of contigs) {
+      if (pos >= c.start && pos <= c.end) {
+        const local = pos - c.start + 1;
+        if (local >= 1e6) return (local/1e6).toFixed(2)+'M';
+        if (local >= 1e3) return (local/1e3).toFixed(1)+'k';
+        return local+'';
+      }
+    }
+    return fmt(pos); // in gap
+  }
+  function inGap(pos) {
+    if (!multiContig) return false;
+    return !contigs.some(c => pos >= c.start && pos <= c.end);
+  }
+
   document.getElementById('genome-name').textContent = genome_name || 'genome';
   document.getElementById('position').textContent =
     `${fmt(vs)} \u2013 ${fmt(ve)}  (${fmt(span)})`;
 
   const out = [];
 
+  // Gray bands for gap regions visible in viewport
+  if (multiContig) {
+    for (let i = 0; i < contigs.length - 1; i++) {
+      const gapS = contigs[i].end, gapE = contigs[i+1].start;
+      if (gapE > vs && gapS < ve) {
+        const x1 = Math.max(0, (gapS - vs) * scale);
+        const x2 = Math.min(W, (gapE - vs) * scale);
+        out.push(`<rect x="${x1|0}" y="0" width="${Math.max(1,(x2-x1))|0}" height="9999" fill="#161b22"/>`);
+      }
+    }
+    // Separator lines at contig starts (except first)
+    for (let i = 1; i < contigs.length; i++) {
+      const x = (contigs[i].start - vs) * scale;
+      if (x >= 0 && x <= W) {
+        out.push(`<line x1="${x|0}" y1="0" x2="${x|0}" y2="9999" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4,3" opacity="0.7"/>`);
+        // Contig name label just above ruler line
+        out.push(`<text x="${(x+3)|0}" y="${RULER_H-1}" font-size="9" fill="#58a6ff" font-family="monospace">${esc(contigs[i].name)}</text>`);
+      }
+    }
+  }
+
   // Ruler
   const tick=niceTick(span,W), first=Math.ceil(vs/tick)*tick;
   out.push(`<line x1="0" y1="${RULER_H}" x2="${W}" y2="${RULER_H}" stroke="#30363d" stroke-width="1"/>`);
   for (let pos=first; pos<=ve; pos+=tick) {
+    if (inGap(pos)) continue;
     const x=(pos-vs)*scale;
     out.push(`<line x1="${x|0}" y1="${RULER_H-7}" x2="${x|0}" y2="${RULER_H}" stroke="#484f58" stroke-width="1"/>`);
-    out.push(`<text x="${(x+3)|0}" y="${RULER_H-10}" font-size="10" fill="#8b949e" font-family="monospace">${fmt(pos)}</text>`);
+    out.push(`<text x="${(x+3)|0}" y="${RULER_H-10}" font-size="10" fill="#8b949e" font-family="monospace">${posLabel(pos)}</text>`);
   }
 
   const yGeneTop = RULER_H + covH;
@@ -379,6 +430,41 @@ function drawSixFrame(features, seq, seqOff, vs, ve, W, scale, out, yTop, hitOnl
         out.push(`<text x="${cx|0}" y="${(revAaY[fr]+FH/2+3)|0}" text-anchor="middle" font-size="${aaFont}" fill="${STOP_COL}" font-family="monospace">*</text>`);
     }
     out.push(`<text x="3" y="${(revAaY[fr]+FH/2+3)|0}" font-size="8" fill="#484f58" font-family="monospace">-${fr+1}</text>`);
+  }
+
+  // ── Custom codon highlights (client-side scan, requires sequence) ─────────
+  const hlSet = getCodonHighlightSet();
+  if (hlSet.size > 0 && seq) {
+    const u    = seq.toUpperCase();
+    const u_rc = rc.toUpperCase();
+    const hlW  = Math.max(2, scale * 3);
+    for (let fr = 0; fr < 3; fr++) {
+      const pStart = ((fr - seqOff % 3 + 3) % 3);
+      for (let p = pStart; p + 2 < seqLen; p += 3) {
+        if (!hlSet.has(u.slice(p, p + 3))) continue;
+        const gp = seqOff + p;
+        const cx = (gp + 1.5 - vs) * scale;
+        if (cx + hlW/2 < 0 || cx - hlW/2 > W) continue;
+        const rx = Math.max(0, (cx - hlW/2)|0);
+        const rw = Math.min(hlW, W - rx);
+        const y1 = fwdAaY[fr] + 2, y2 = fwdAaY[fr] + FH - 2;
+        out.push(`<rect x="${rx}" y="${y1}" width="${rw}" height="${y2-y1}" fill="${CODON_HL_COL}" opacity="0.32" rx="1"/>`);
+        if (showAA) out.push(`<text x="${cx|0}" y="${(fwdAaY[fr]+FH/2+3)|0}" text-anchor="middle" font-size="${aaFont}" fill="${CODON_HL_COL}" font-family="monospace">${translateCodon(u.slice(p,p+3))}</text>`);
+      }
+      for (let p = fr; p + 2 < seqLen; p += 3) {
+        if (!hlSet.has(u_rc.slice(p, p + 3))) continue;
+        const gEnd = seqOff + seqLen - 1 - p;
+        const gLeft = gEnd - 2;
+        const cx = (gLeft + 1.5 - vs) * scale;
+        if (cx + hlW/2 < 0 || cx - hlW/2 > W) continue;
+        const rfr = gEnd % 3;
+        const rx = Math.max(0, (cx - hlW/2)|0);
+        const rw = Math.min(hlW, W - rx);
+        const y1 = revAaY[rfr] + 2, y2 = revAaY[rfr] + FH - 2;
+        out.push(`<rect x="${rx}" y="${y1}" width="${rw}" height="${y2-y1}" fill="${CODON_HL_COL}" opacity="0.32" rx="1"/>`);
+        if (showAA) out.push(`<text x="${cx|0}" y="${(revAaY[rfr]+FH/2+3)|0}" text-anchor="middle" font-size="${aaFont}" fill="${CODON_HL_COL}" font-family="monospace">${translateCodon(u_rc.slice(p,p+3))}</text>`);
+      }
+    }
   }
 
   // ── Gene arrows in their per-frame rows ────────────────────────────────────
