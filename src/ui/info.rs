@@ -101,7 +101,15 @@ pub(super) fn draw_info_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let (msg, fg) = if app.search_mode {
+    let (msg, fg) = if app.blast_file_open {
+        let target = if app.blast_target_idx == 0 { "6FT" } else { "GFF proteins" };
+        (format!(" DIAMOND ({}) query: {}▌  (Tab: complete, Enter: run, Esc: cancel)",
+            target, app.blast_file_path),
+         Color::Rgb(230, 180, 60))
+    } else if app.blast_running {
+        let dots = match (app.anim_tick / 4) % 3 { 0 => ".", 1 => "..", _ => "..." };
+        (format!(" DIAMOND running{}", dots), Color::Rgb(230, 180, 60))
+    } else if app.search_mode {
         (format!(" / {}▌  (Enter to search, Esc to cancel)", app.search_query),
          Color::Rgb(250, 220, 100))
     } else {

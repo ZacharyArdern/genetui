@@ -43,6 +43,11 @@ pub struct BrowserState {
     pub plasmid_sizes: Vec<u64>,
     pub plasmid_features: Vec<Vec<BrowserFeature>>,
     pub plasmid_gc_skew: Vec<Vec<f32>>,
+    // Pre-computed stop codon positions [frame0, frame1, frame2], viewport-clipped, 0-based
+    pub stop_codons_plus:  Vec<Vec<u32>>,
+    pub stop_codons_minus: Vec<Vec<u32>>,
+    // DIAMOND blast hits overlaid as yellow features
+    pub blast_features: Vec<BrowserFeature>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -107,16 +112,17 @@ impl WebServer {
         let app = Router::new()
             .route("/",   get(serve_html))
             .route("/ws", get(ws_handler))
-            .route("/static/genome_track.js", get(|| async { ([("content-type", "application/javascript")], JS_GENOME_TRACK) }))
-            .route("/static/coverage.js",     get(|| async { ([("content-type", "application/javascript")], JS_COVERAGE) }))
-            .route("/static/navigation.js",   get(|| async { ([("content-type", "application/javascript")], JS_NAVIGATION) }))
-            .route("/static/panels.js",       get(|| async { ([("content-type", "application/javascript")], JS_PANELS) }))
-            .route("/static/gene_plot.js",    get(|| async { ([("content-type", "application/javascript")], JS_GENE_PLOT) }))
-            .route("/static/structure.js",    get(|| async { ([("content-type", "application/javascript")], JS_STRUCTURE) }))
-            .route("/static/websocket.js",    get(|| async { ([("content-type", "application/javascript")], JS_WEBSOCKET) }))
-            .route("/static/gene_info.js",    get(|| async { ([("content-type", "application/javascript")], JS_GENE_INFO) }))
-            .route("/static/msa_panel.js",      get(|| async { ([("content-type", "application/javascript")], JS_MSA_PANEL) }))
-            .route("/static/circular_plot.js", get(|| async { ([("content-type", "application/javascript")], JS_CIRCULAR_PLOT) }))
+            .route("/static/genome_track.js", get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_GENOME_TRACK) }))
+            .route("/static/coverage.js",     get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_COVERAGE) }))
+            .route("/static/navigation.js",   get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_NAVIGATION) }))
+            .route("/static/panels.js",       get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_PANELS) }))
+            .route("/static/gene_plot.js",    get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_GENE_PLOT) }))
+            .route("/static/structure.js",    get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_STRUCTURE) }))
+            .route("/static/websocket.js",    get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_WEBSOCKET) }))
+            .route("/static/gene_info.js",    get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_GENE_INFO) }))
+            .route("/static/msa_panel.js",    get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_MSA_PANEL) }))
+            .route("/static/circular_plot.js", get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_CIRCULAR_PLOT) }))
+            .route("/static/fancy_track.js",   get(|| async { ([("content-type", "application/javascript"), ("cache-control", "no-store")], JS_FANCY_TRACK) }))
             .route("/circular-map.svg",        get(circular_map_svg))
             .with_state(self);
 
@@ -167,7 +173,9 @@ async fn circular_map_svg(
         )
     };
 
-    let svg = build_circular_svg(&name, size, &features, &gc_skew, dark, show_nc, show_legend, title, genome_idx);
+    let blast = state.blast_features.clone();
+    drop(state);
+    let svg = build_circular_svg(&name, size, &features, &gc_skew, &blast, dark, show_nc, show_legend, title, genome_idx);
     ([("content-type", "image/svg+xml")], svg)
 }
 
@@ -188,6 +196,7 @@ fn build_circular_svg(
     size: u64,
     features: &[BrowserFeature],
     gc_skew: &[f32],
+    blast_features: &[BrowserFeature],
     dark: bool, show_nc: bool, show_legend: bool, custom_title: Option<&str>,
     id_sfx: usize,
 ) -> String {
@@ -204,20 +213,24 @@ fn build_circular_svg(
     let ring_color = if dark { "#30363d" } else { "#cccccc" };
 
     // Track radii as fractions of cx (working inward)
-    let r_lbl_f      = 0.97f64;
-    let r_tick_o_f   = 0.94f64;
-    let r_plus_o_f   = 0.93f64;  // +strand density outer
-    let r_plus_i_f   = 0.81f64;  // +strand density inner  (12%)
-    let r_minus_o_f  = 0.80f64;  // -strand density outer
-    let r_minus_i_f  = 0.68f64;  // -strand density inner  (12%)
-    let r_nc_o_f     = 0.67f64;
-    let r_nc_i_f     = 0.59f64;
-    let (r_skew_o_f, r_skew_i_f) = if show_nc { (0.58f64, 0.49f64) } else { (0.66f64, 0.57f64) };
-    let r_inner_f    = r_skew_i_f;
+    // Layout: GC skew (outer) → +density (1.5×wide) → −density (1.5×wide) → NC → blast
+    let r_lbl_f     = 0.985f64;
+    let r_tick_o_f  = 0.956f64;
+    let r_skew_o_f  = 0.950f64;  // GC skew outer (outermost data ring)
+    let r_skew_i_f  = 0.878f64;  // GC skew inner  (7.2% band)
+    let r_plus_o_f  = 0.872f64;  // +strand density outer
+    let r_plus_i_f  = 0.692f64;  // +strand density inner (18% = 1.5×)
+    let r_minus_o_f = 0.686f64;  // −strand density outer
+    let r_minus_i_f = 0.506f64;  // −strand density inner (18%)
+    let r_nc_o_f    = 0.500f64;  // NC features outer
+    let r_nc_i_f    = 0.438f64;  // NC features inner (6.2%)
+    let r_blast_o_f = 0.432f64;  // blast hits outer (dedicated ring)
+    let r_blast_i_f = 0.372f64;  // blast hits inner (6%)
+    let r_inner_f   = r_blast_i_f;
 
-    // Absolute pixel values in viewBox units for JS
-    let r_outer_abs = cx * r_plus_o_f;
-    let r_inner_abs = cx * r_inner_f;
+    // Absolute pixel values in viewBox units for JS click area
+    let r_outer_abs = cx * r_skew_o_f;
+    let r_inner_abs = cx * r_blast_i_f;
 
     let rf = |f: f64| cx * f;
 
@@ -281,9 +294,10 @@ fn build_circular_svg(
         let pad = ((mx - mn) * 0.05).max(1e-6);
         (mn - pad, mx + pad)
     };
-    let skew_col_lo  = if dark { "#61afef" } else { "#2780b9" };
-    let skew_col_mid = if dark { "#21262d" } else { "#f0f0f0" };
-    let skew_col_hi  = if dark { "#e06c75" } else { "#c0392b" };
+    // GC skew: green (positive) → grey → purple (negative), matching TUI skew_to_color
+    let skew_col_lo  = if dark { "#c419ff" } else { "#8250df" };  // purple  (negative)
+    let skew_col_mid = if dark { "#505050" } else { "#d0d0d0" };  // neutral
+    let skew_col_hi  = if dark { "#1ee646" } else { "#1a7f37" };  // green   (positive)
     // Per-SVG unique IDs so multiple inline SVGs don't clash
     let gp = format!("lg-plus-{id_sfx}");
     let gm = format!("lg-minus-{id_sfx}");
@@ -310,25 +324,36 @@ fn build_circular_svg(
     );
 
     // ── Track ring outlines ────────────────────────────────────────────────────
-    for &f in &[r_plus_o_f, r_plus_i_f, r_minus_o_f, r_minus_i_f] {
+    let mut outline_rings = vec![r_skew_o_f, r_skew_i_f, r_plus_o_f, r_plus_i_f, r_minus_o_f, r_minus_i_f];
+    if show_nc { outline_rings.extend_from_slice(&[r_nc_o_f, r_nc_i_f]); }
+    outline_rings.extend_from_slice(&[r_blast_o_f, r_blast_i_f]);
+    for &f in &outline_rings {
         let r = rf(f);
         svg.push_str(&format!(
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
-"#));
+            "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" fill=\"none\" stroke=\"{ring_color}\" stroke-width=\"0.8\"/>\n"
+        ));
     }
-    if show_nc {
-        for &f in &[r_nc_o_f, r_nc_i_f] {
-            let r = rf(f);
-            svg.push_str(&format!(
-                r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
-"#));
+
+    // ── GC skew (outermost data ring) ─────────────────────────────────────────
+    if !gc_skew.is_empty() {
+        let n = gc_skew.len();
+        for i in 0..n {
+            let ws = (i as u64 * size) / n as u64;
+            let we = ((i + 1) as u64 * size) / n as u64;
+            if we <= ws { continue; }
+            let v = gc_skew[i] as f64;
+            let color = if v >= 0.0 {
+                let t = (v / skew_max.max(1e-9)).clamp(0.0, 1.0);
+                if dark { lerp_color(t, 0x50,0x50,0x50, 0x1e,0xe6,0x46) }
+                else    { lerp_color(t, 0xd0,0xd0,0xd0, 0x1a,0x7f,0x37) }
+            } else {
+                let t = (v / skew_min.min(-1e-9)).clamp(0.0, 1.0);
+                if dark { lerp_color(t, 0x50,0x50,0x50, 0xc4,0x19,0xff) }
+                else    { lerp_color(t, 0xd0,0xd0,0xd0, 0x82,0x50,0xdf) }
+            };
+            let path = arc_path(ws, we, rf(r_skew_i_f), rf(r_skew_o_f));
+            svg.push_str(&format!("<path d=\"{path}\" fill=\"{color}\" stroke=\"none\"/>\n"));
         }
-    }
-    for &f in &[r_skew_o_f, r_skew_i_f] {
-        let r = rf(f);
-        svg.push_str(&format!(
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="none" stroke="{ring_color}" stroke-width="1.0"/>
-"#));
     }
 
     // ── +strand density heatmap ────────────────────────────────────────────────
@@ -339,8 +364,7 @@ fn build_circular_svg(
         let t     = (plus_c[wi] as f64 - plus_min) / (plus_max - plus_min);
         let color = lerp_color(t, p_r0,p_g0,p_b0, p_r1,p_g1,p_b1);
         let path  = arc_path(ws, we, rf(r_plus_i_f), rf(r_plus_o_f));
-        svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
-"#));
+        svg.push_str(&format!("<path d=\"{path}\" fill=\"{color}\" stroke=\"none\"/>\n"));
     }
 
     // ── -strand density heatmap ────────────────────────────────────────────────
@@ -351,42 +375,28 @@ fn build_circular_svg(
         let t     = (minus_c[wi] as f64 - minus_min) / (minus_max - minus_min);
         let color = lerp_color(t, m_r0,m_g0,m_b0, m_r1,m_g1,m_b1);
         let path  = arc_path(ws, we, rf(r_minus_i_f), rf(r_minus_o_f));
-        svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
-"#));
+        svg.push_str(&format!("<path d=\"{path}\" fill=\"{color}\" stroke=\"none\"/>\n"));
     }
 
-    // ── NC feature arcs (optional) ────────────────────────────────────────────
+    // ── NC feature arcs ────────────────────────────────────────────────────────
     if show_nc {
         for f in features {
             if !f.noncoding || f.end <= f.start { continue; }
             let path = arc_path(f.start, f.end, rf(r_nc_i_f), rf(r_nc_o_f));
-            svg.push_str(&format!(r#"<path d="{path}" fill="{}" stroke="none"/>
-"#, f.color));
+            svg.push_str(&format!("<path d=\"{path}\" fill=\"{}\" stroke=\"none\"/>\n", f.color));
         }
     }
 
-    // ── GC skew heatmap (innermost band) ──────────────────────────────────────
-    if !gc_skew.is_empty() {
-        let n = gc_skew.len();
-        for i in 0..n {
-            let ws = (i as u64 * size) / n as u64;
-            let we = ((i + 1) as u64 * size) / n as u64;
-            if we <= ws { continue; }
-            let v = gc_skew[i] as f64;
-            // Normalise within actual data range; mid-point = 0
-            let color = if v >= 0.0 {
-                let t = (v / skew_max.max(1e-9)).clamp(0.0, 1.0);
-                if dark { lerp_color(t, 0x21,0x26,0x2d, 0xe0,0x6c,0x75) }
-                else    { lerp_color(t, 0xf0,0xf0,0xf0, 0xc0,0x39,0x2b) }
-            } else {
-                let t = (v / skew_min.min(-1e-9)).clamp(0.0, 1.0);
-                if dark { lerp_color(t, 0x21,0x26,0x2d, 0x61,0xaf,0xef) }
-                else    { lerp_color(t, 0xf0,0xf0,0xf0, 0x27,0x80,0xb9) }
-            };
-            let path = arc_path(ws, we, rf(r_skew_i_f), rf(r_skew_o_f));
-            svg.push_str(&format!(r#"<path d="{path}" fill="{color}" stroke="none"/>
-"#));
+    // ── DIAMOND blast hit arcs (dedicated inner ring) ─────────────────────────
+    if !blast_features.is_empty() {
+        svg.push_str("<g id=\"blast-hits\" opacity=\"0.9\">\n");
+        for bf in blast_features {
+            if bf.end <= bf.start || bf.start >= size { continue; }
+            let path = arc_path(bf.start, bf.end.min(size), rf(r_blast_i_f), rf(r_blast_o_f));
+            let title = svg_esc(&bf.name);
+            svg.push_str(&format!("<path d=\"{path}\" fill=\"#e6b800\" stroke=\"none\"><title>{title}</title></path>\n"));
         }
+        svg.push_str("</g>\n");
     }
 
     // ── Tick marks + labels ────────────────────────────────────────────────────
@@ -462,30 +472,40 @@ fn build_circular_svg(
             r#"<rect x="808" y="0" width="192" height="{svg_h}" fill="{bg}"/>
 "#));
 
-        // Rows: +strand, -strand, GC skew, [nc if shown]
-        struct LegRow { label: &'static str, grad: String, lo: String, hi: String }
+        // Rows (outer → inner): GC skew, + strand, − strand, [NC], [DIAMOND]
+        struct LegRow { label: &'static str, grad: String, lo: String, hi: String, solid: Option<String> }
         let rows = {
             let mut v = vec![
+                LegRow {
+                    label: "GC skew",
+                    grad:  gs.clone(),
+                    lo:    format!("{:.3}", skew_min),
+                    hi:    format!("{:.3}", skew_max),
+                    solid: None,
+                },
                 LegRow {
                     label: "+ strand",
                     grad:  gp.clone(),
                     lo:    format!("{:.0}%", plus_min / win as f64 * 100.0),
                     hi:    format!("{:.0}%", plus_max / win as f64 * 100.0),
+                    solid: None,
                 },
                 LegRow {
                     label: "- strand",
                     grad:  gm.clone(),
                     lo:    format!("{:.0}%", minus_min / win as f64 * 100.0),
                     hi:    format!("{:.0}%", minus_max / win as f64 * 100.0),
-                },
-                LegRow {
-                    label: "GC skew",
-                    grad:  gs.clone(),
-                    lo:    format!("{:.3}", skew_min),
-                    hi:    format!("{:.3}", skew_max),
+                    solid: None,
                 },
             ];
-            if show_nc { v.push(LegRow { label: "NC feat.", grad: gp.clone(), lo: String::new(), hi: String::new() }); }
+            if show_nc {
+                v.push(LegRow { label: "NC feat.", grad: gp.clone(), lo: String::new(), hi: String::new(),
+                    solid: Some(if dark { "#8b949e".into() } else { "#6e7681".into() }) });
+            }
+            if !blast_features.is_empty() {
+                v.push(LegRow { label: "DIAMOND", grad: gp.clone(), lo: String::new(), hi: String::new(),
+                    solid: Some("#e6b800".into()) });
+            }
             v
         };
 
@@ -504,12 +524,10 @@ fn build_circular_svg(
 "#,
                 lx + bw / 2.0, ry - 3.0, row.label
             ));
-            if row.label == "NC feat." {
-                // Solid swatch
-                let nc_col = if dark { "#8b949e" } else { "#6e7681" };
+            if let Some(ref solid_col) = row.solid {
                 svg.push_str(&format!(
-                    r#"<rect x="{lx:.1}" y="{ry:.1}" width="{bw:.1}" height="{bh:.1}" rx="1" fill="{nc_col}"/>
-"#));
+                    "<rect x=\"{lx:.1}\" y=\"{ry:.1}\" width=\"{bw:.1}\" height=\"{bh:.1}\" rx=\"1\" fill=\"{solid_col}\"/>\n"
+                ));
             } else {
                 // Gradient bar
                 svg.push_str(&format!(
@@ -615,6 +633,7 @@ const JS_WEBSOCKET:    &str = include_str!("web/websocket.js");
 const JS_GENE_INFO:    &str = include_str!("web/gene_info.js");
 const JS_MSA_PANEL:    &str = include_str!("web/msa_panel.js");
 const JS_CIRCULAR_PLOT: &str = include_str!("web/circular_plot.js");
+const JS_FANCY_TRACK:   &str = include_str!("web/fancy_track.js");
 
 // ── Embedded HTML shell ───────────────────────────────────────────────────────
 const HTML: &str = r#####"<!DOCTYPE html>
@@ -652,11 +671,27 @@ body {
 .hbtn:hover { background: #30363d; }
 .hbtn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 
+/* ── Main browser bar ────────────────────────────────────────────────────── */
+#main-browser-bar {
+  height: 30px; padding: 0 10px; background: #161b22; border-bottom: 1px solid #30363d;
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+#main-browser-label { font-size: 11px; color: #8b949e; }
+#main-browser-opts-box {
+  position: fixed; z-index: 300;
+  background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+  padding: 14px 16px; width: 260px; box-shadow: 0 8px 32px rgba(0,0,0,.6);
+  cursor: default; user-select: none; display: none;
+}
+
 /* ── Live SVG track ──────────────────────────────────────────────────────── */
 #live-panel { flex-shrink: 0; overflow: hidden; position: relative; cursor: grab; }
 #live-panel.dragging { cursor: grabbing; }
-#svg { width: 100%; height: 100%; display: block; }
+#svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .gene:hover polygon { opacity: 0.75; }
+/* ── Fancy tile layer ────────────────────────────────────────────────────── */
+#fancy-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.ftile { position: absolute; pointer-events: none; overflow: hidden; }
 
 /* ── Drag handle ─────────────────────────────────────────────────────────── */
 #drag-handle {
@@ -818,8 +853,24 @@ body {
   <span id="status" class="badge disconnected">disconnected</span>
 </div>
 
+<!-- Main browser bar -->
+<div id="main-browser-bar">
+  <span id="main-browser-label">Main browser</span>
+  <form id="browser-search-form" style="display:flex;gap:4px;margin-left:10px" onsubmit="return false">
+    <input id="browser-search" type="text" placeholder="search gene / position&#8230;"
+      style="font-size:11px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:2px 7px;width:200px;font-family:monospace;outline:none"
+      autocomplete="off" spellcheck="false">
+    <button class="dbtn" type="submit" id="btn-browser-search">&#128269;</button>
+  </form>
+  <div id="browser-search-results" style="display:none;position:fixed;z-index:400;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:4px 0;min-width:260px;max-height:200px;overflow-y:auto;box-shadow:0 4px 20px rgba(0,0,0,.7);font-family:monospace;font-size:11px"></div>
+  <div style="margin-left:auto;display:flex;gap:5px">
+    <button class="dbtn" id="btn-main-browser-opts">&#9881; Options</button>
+  </div>
+</div>
+
 <!-- Live SVG track -->
 <div id="live-panel" style="height:55vh">
+  <div id="fancy-layer"></div>
   <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
 </div>
 
@@ -946,6 +997,59 @@ body {
 
 </div>
 
+<!-- Main browser options dropdown -->
+<div id="main-browser-opts-box">
+  <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Main browser options</div>
+  <div class="og">
+    <div class="cr" style="grid-column:1/-1">
+      <label for="opt-max-span">Max view width</label>
+      <select id="opt-max-span">
+        <option value="10000">10 kb</option>
+        <option value="50000">50 kb</option>
+        <option value="100000" selected>100 kb</option>
+        <option value="500000">500 kb</option>
+        <option value="1000000">1 Mb</option>
+        <option value="0">Unlimited</option>
+      </select>
+    </div>
+    <div class="cr">
+      <input type="checkbox" id="opt-sixframe" checked>
+      <label for="opt-sixframe">Six-frame layout</label>
+    </div>
+    <div class="cr">
+      <input type="checkbox" id="opt-nucleotides">
+      <label for="opt-nucleotides">Nucleotide tracks (±nt)</label>
+    </div>
+    <div class="cr">
+      <input type="checkbox" id="opt-stopcodons" checked>
+      <label for="opt-stopcodons">Stop codons</label>
+    </div>
+    <div class="cr" style="grid-column:1/-1">
+      <label for="opt-gencode" style="min-width:90px">Genetic code</label>
+      <select id="opt-gencode">
+        <option value="1">Standard</option>
+        <option value="11">Bacterial / Archaeal / Plastid</option>
+        <option value="2">Vertebrate Mitochondrial</option>
+        <option value="4">Mycoplasma / Spiroplasma</option>
+      </select>
+    </div>
+    <div class="cr" style="grid-column:1/-1">
+      <label for="cov-style-svg">Coverage (live)</label>
+      <select id="cov-style-svg">
+        <option value="none">None</option>
+        <option value="both">Both strands</option>
+        <option value="plus">Plus strand</option>
+        <option value="minus">Minus strand</option>
+      </select>
+    </div>
+    <div class="cr" style="grid-column:1/-1">
+      <label for="cov-height">Coverage height</label>
+      <input type="range" id="cov-height" min="20" max="120" step="5" value="50">
+      <span class="cv" id="lbl-cov-height">50</span><span style="font-size:10px">px</span>
+    </div>
+  </div>
+</div>
+
 <!-- Options dropdown (anchored to btn-opts, not an overlay) -->
 <div id="opts-box" style="display:none">
   <h3>Custom gene plot options</h3>
@@ -985,26 +1089,6 @@ body {
   <hr class="osep">
   <div class="og">
     <div class="cr">
-      <input type="checkbox" id="opt-sixframe" checked>
-      <label for="opt-sixframe">Six-frame layout (live + figure)</label>
-    </div>
-    <div class="cr">
-      <input type="checkbox" id="opt-stopcodons" checked>
-      <label for="opt-stopcodons">Stop codons (live + figure)</label>
-    </div>
-    <div class="cr" style="grid-column:1/-1">
-      <label for="opt-gencode" style="min-width:90px">Genetic code</label>
-      <select id="opt-gencode">
-        <option value="1">Standard</option>
-        <option value="11">Bacterial / Archaeal / Plastid</option>
-        <option value="2">Vertebrate Mitochondrial</option>
-        <option value="4">Mycoplasma / Spiroplasma</option>
-      </select>
-    </div>
-  </div>
-  <hr class="osep">
-  <div class="og">
-    <div class="cr">
       <label for="cov-style-fig">Coverage (figure)</label>
       <select id="cov-style-fig">
         <option value="none">None</option>
@@ -1026,5 +1110,6 @@ body {
 <script src="/static/gene_info.js"></script>
 <script src="/static/msa_panel.js"></script>
 <script src="/static/circular_plot.js"></script>
+<script src="/static/fancy_track.js"></script>
 </body>
 </html>"#####;

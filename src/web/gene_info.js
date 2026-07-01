@@ -17,7 +17,8 @@ function onStatusUpdate() {
 
 function geneFromIdx(idx) {
   if (!lastState) return null;
-  return lastState.features.find(f => f._idx === idx) || null;
+  return lastState.features.find(f => f._idx === idx)
+    || (lastState.blast_features || []).find(f => f._idx === idx) || null;
 }
 
 function renderGeneInfo(f) {

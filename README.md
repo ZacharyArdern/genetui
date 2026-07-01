@@ -4,7 +4,7 @@
   <img src="genetui.png" alt="genetui logo" width="180"/>
 </p>
 
-A fast terminal-based genome research tool written in Rust, with a live-synced browser extension for publication-ready figures and higher quality visualisations.
+A fast terminal-based genome exploration tool written in Rust, with a live-synced browser extension for higher quality visualisations.
 
 ## Features
 
@@ -15,6 +15,14 @@ A fast terminal-based genome research tool written in Rust, with a live-synced b
 - **Protein structure viewer** — fold any selected gene with `f` (minifold); 3Dmol.js panel appears automatically, coloured by pLDDT
 - **Multiple sequence alignment** — DIAMOND homolog search against any protein database, aligned with FAMSA2; visualised in the TUI (braille/block rendering from seqtui) or in the browser (biotite)
 - **Six-frame translation** — correct frame assignment for both strands, stop codons as tick marks, matching between TUI and browser views
+
+## Easy Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ZacharyArdern/genetui/main/install.sh | sh
+```
+
+Installs the latest release binary to `~/.local/bin`. Supports **macOS (Apple Silicon)** and **Linux (x86\_64)**. For other platforms, [build from source](#building).
 
 ## Usage
 
@@ -61,14 +69,14 @@ Requires Rust 1.70+. The `rust-htslib` dependency needs `htslib` headers (`brew 
 
 If you use genetui in your research, please cite:
 
-> Ardern, Z. (2026). *genetui: a terminal-based genome browser with live browser extension* [Computer software]. GitHub. https://github.com/ZacharyArdern/genetui
+> Ardern, Z. (2026). *genetui: a terminal-based genome exploration tool with browser extension* [Computer software]. GitHub. https://github.com/ZacharyArdern/genetui
 
 BibTeX:
 
 ```bibtex
 @software{ardern2026genetui,
   author  = {Ardern, Zachary},
-  title   = {genetui: a terminal-based genome browser with live browser extension},
+  title   = {genetui: a terminal-based genome exploration tool with browser extension},
   year    = {2026},
   url     = {https://github.com/ZacharyArdern/genetui}
 }

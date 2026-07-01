@@ -18,7 +18,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::process::Command as TokioCommand;
 
 use app::{App, PlasmidData};
-use core::{compute_alignment_coverage, compute_gc_skew, find_stop_codons, parse_fasta, parse_gff, translate};
+use core::{compute_alignment_coverage, compute_gc_skew, find_stop_codons, parse_fasta, parse_gff, reverse_complement_str, translate};
 
 #[derive(Parser, Debug)]
 #[command(name = "genetui", about = "Terminal genome browser")]
@@ -264,6 +264,7 @@ async fn run_loop(
 ) -> Result<()> {
     let mut fold_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>> = None;
     let mut msa_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<(String, String)>>>> = None;
+    let mut diamond_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<core::Feature>>>> = None;
 
     loop {
         // Expire old status messages
@@ -332,11 +333,40 @@ async fn run_loop(
             push_browser_state(app, web);
         }
 
+        // Poll for completed DIAMOND blast
+        let mut diamond_completed = false;
+        if let Some(ref mut rx) = diamond_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    app.blast_running = false;
+                    match result {
+                        Ok(feats) => {
+                            let n = feats.len();
+                            app.blast_features = feats;
+                            app.set_status(format!("DIAMOND: {} hits", n));
+                            diamond_completed = true;
+                        }
+                        Err(e) => {
+                            app.blast_error = Some(format!("{}", e));
+                            app.set_status(format!("DIAMOND error: {}", e));
+                        }
+                    }
+                    diamond_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => { diamond_rx = None; app.blast_running = false; }
+            }
+        }
+        if diamond_completed {
+            push_browser_state(app, web);
+        }
+
         // Apply viewport commands from browser
         if let Some((vs, ve)) = web.take_viewport_cmd() {
             if ve > vs && ve <= app.genome_size {
                 app.view_start = vs;
                 app.view_end   = ve;
+                push_browser_state(app, web);
             }
         }
 
@@ -459,6 +489,81 @@ async fn run_loop(
                             }
                             KeyCode::Char(' ') | KeyCode::Enter => {
                                 app.toggle_display_opt();
+                            }
+                            _ => {}
+                        }
+                    } else if app.search_menu_open {
+                        match key.code {
+                            KeyCode::Esc => { app.search_menu_open = false; }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.search_menu_idx > 0 { app.search_menu_idx -= 1; }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.search_menu_idx < 1 { app.search_menu_idx += 1; }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                app.search_menu_open = false;
+                                if app.search_menu_idx == 0 {
+                                    // Gene / Coordinate search
+                                    app.search_mode = true;
+                                    app.search_query.clear();
+                                    app.status_msg.clear();
+                                } else {
+                                    // DIAMOND blast: open target menu
+                                    app.blast_target_open = true;
+                                    app.blast_target_idx = 0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if app.blast_target_open {
+                        match key.code {
+                            KeyCode::Esc => { app.blast_target_open = false; }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.blast_target_idx > 0 { app.blast_target_idx -= 1; }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.blast_target_idx < 1 { app.blast_target_idx += 1; }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                app.blast_target_open = false;
+                                app.blast_file_open = true;
+                                app.blast_file_path.clear();
+                                app.blast_completions.clear();
+                                app.blast_completion_idx = 0;
+                            }
+                            _ => {}
+                        }
+                    } else if app.blast_file_open {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.blast_file_open = false;
+                                app.blast_file_path.clear();
+                                app.blast_completions.clear();
+                            }
+                            KeyCode::Enter => {
+                                app.blast_file_open = false;
+                                app.blast_completions.clear();
+                                start_diamond(app, &mut diamond_rx).await;
+                            }
+                            KeyCode::Backspace => {
+                                app.blast_file_path.pop();
+                                app.blast_completions.clear();
+                            }
+                            KeyCode::Tab => {
+                                if app.blast_completions.is_empty() {
+                                    app.blast_completions = blast_completions(&app.blast_file_path);
+                                    app.blast_completion_idx = 0;
+                                } else {
+                                    app.blast_completion_idx = (app.blast_completion_idx + 1) % app.blast_completions.len();
+                                }
+                                if !app.blast_completions.is_empty() {
+                                    app.blast_file_path = app.blast_completions[app.blast_completion_idx].clone();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app.blast_file_path.push(c);
+                                app.blast_completions.clear();
                             }
                             _ => {}
                         }
@@ -651,9 +756,8 @@ async fn run_loop(
                                 push_browser_state(app, web);
                             }
                             KeyCode::Char('/') => {
-                                app.search_mode = true;
-                                app.search_query.clear();
-                                app.status_msg.clear();
+                                app.search_menu_open = true;
+                                app.search_menu_idx = 0;
                             }
                             KeyCode::Char('n') => {
                                 app.search_next();
@@ -926,6 +1030,223 @@ async fn start_msa_search(
     });
 }
 
+async fn start_diamond(
+    app: &mut App,
+    diamond_rx: &mut Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<core::Feature>>>>,
+) {
+    if app.blast_running { return; }
+    let query_fasta = app.blast_file_path.trim().to_string();
+    if query_fasta.is_empty() {
+        app.set_status("DIAMOND: no query file specified");
+        return;
+    }
+    let expanded_path = if query_fasta.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}{}", home, &query_fasta[1..])
+    } else {
+        query_fasta.clone()
+    };
+    if !std::path::Path::new(&expanded_path).exists() {
+        app.set_status(format!("DIAMOND: file not found: {}", query_fasta));
+        return;
+    }
+    let genome_seq = match app.genome_seq.clone() {
+        Some(s) => s,
+        None => { app.set_status("DIAMOND: no genome sequence loaded"); return; }
+    };
+    let use_6ft = app.blast_target_idx == 0;
+    let features_for_blastp = if !use_6ft { app.features.clone() } else { Vec::new() };
+    let genome_size = app.genome_size;
+
+    app.blast_running = true;
+    app.blast_error = None;
+    app.blast_features.clear();
+    app.set_status("DIAMOND running\u{2026}");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *diamond_rx = Some(rx);
+
+    tokio::spawn(async move {
+        let result = run_diamond(genome_seq, genome_size, expanded_path, use_6ft, features_for_blastp).await;
+        let _ = tx.send(result);
+    });
+}
+
+async fn run_diamond(
+    genome_seq: String,
+    genome_size: u64,
+    query_fasta: String,
+    use_6ft: bool,
+    annotated_features: Vec<core::Feature>,
+) -> anyhow::Result<Vec<core::Feature>> {
+    use std::process::Stdio;
+    use std::io::Write;
+
+    let pid = std::process::id();
+    let tmp = std::env::temp_dir();
+    let db_path   = tmp.join(format!("genetui_db_{}", pid));
+    let out_tsv   = tmp.join(format!("genetui_hits_{}.tsv", pid));
+
+    let (query_file, feat_map): (std::path::PathBuf, HashMap<String, (u64, u64, char)>) = if use_6ft {
+        let genome_fasta = tmp.join(format!("genetui_genome_{}.fna", pid));
+        let mut f = std::fs::File::create(&genome_fasta)?;
+        writeln!(f, ">genome")?;
+        writeln!(f, "{}", genome_seq)?;
+        (genome_fasta, HashMap::new())
+    } else {
+        let protein_fasta = tmp.join(format!("genetui_proteins_{}.faa", pid));
+        let mut content = String::new();
+        let mut feat_map: HashMap<String, (u64, u64, char)> = HashMap::new();
+        for (i, feat) in annotated_features.iter().enumerate() {
+            if feat.noncoding || feat.end <= feat.start { continue; }
+            let s = (feat.start as usize).saturating_sub(1).min(genome_seq.len());
+            let e = (feat.end as usize).min(genome_seq.len());
+            if e <= s || e - s < 30 { continue; }
+            let raw = &genome_seq[s..e];
+            let to_translate = if feat.strand == '-' {
+                reverse_complement_str(raw)
+            } else {
+                raw.to_string()
+            };
+            let aa = translate(&to_translate);
+            if aa.len() < 10 { continue; }
+            let id = format!("f{}", i);
+            content.push_str(&format!(">{}\n{}\n", id, aa));
+            feat_map.insert(id, (feat.start, feat.end, feat.strand));
+        }
+        if content.is_empty() {
+            return Err(anyhow::anyhow!("No translatable CDS features found in GFF"));
+        }
+        std::fs::write(&protein_fasta, content)?;
+        (protein_fasta, feat_map)
+    };
+
+    // Build DIAMOND DB from query FASTA
+    let db_status = TokioCommand::new("diamond")
+        .args(["makedb", "--in", query_fasta.as_str(), "--db", db_path.to_str().unwrap_or(""), "--quiet"])
+        .stdout(Stdio::null()).stderr(Stdio::piped())
+        .output().await
+        .map_err(|e| anyhow::anyhow!("diamond not found on PATH: {}", e))?;
+    if !db_status.status.success() {
+        let e = String::from_utf8_lossy(&db_status.stderr);
+        return Err(anyhow::anyhow!("diamond makedb failed: {}", &e[..e.len().min(300)]));
+    }
+
+    // Run blast
+    let blast_cmd = if use_6ft { "blastx" } else { "blastp" };
+    let db_dmnd = format!("{}.dmnd", db_path.display());
+    let blast_out = TokioCommand::new("diamond")
+        .args([
+            blast_cmd,
+            "--query", query_file.to_str().unwrap_or(""),
+            "--db", &db_dmnd,
+            "--outfmt", "6", "qseqid", "sseqid", "qstart", "qend", "pident", "evalue",
+            "--out", out_tsv.to_str().unwrap_or(""),
+            "--max-target-seqs", "1",
+            "--quiet",
+        ])
+        .stdout(Stdio::null()).stderr(Stdio::piped())
+        .output().await?;
+    if !blast_out.status.success() {
+        let e = String::from_utf8_lossy(&blast_out.stderr);
+        return Err(anyhow::anyhow!("diamond {} failed: {}", blast_cmd, &e[..e.len().min(300)]));
+    }
+
+    // Parse results
+    let tsv = std::fs::read_to_string(&out_tsv).unwrap_or_default();
+    let mut results: Vec<core::Feature> = Vec::new();
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
+    if use_6ft {
+        for line in tsv.lines() {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 6 { continue; }
+            let qs: i64 = p[2].parse().unwrap_or(0);
+            let qe: i64 = p[3].parse().unwrap_or(0);
+            let (start, end, strand) = if qs <= qe {
+                (qs as u64, qe as u64, '+')
+            } else {
+                (qe as u64, qs as u64, '-')
+            };
+            if start == 0 || end <= start || end > genome_size { continue; }
+            if !seen.insert((start, end)) { continue; }
+            results.push(core::Feature {
+                start, end, strand,
+                name: p[1].to_string(),
+                locus_tag: String::new(),
+                color_idx: results.len(),
+                is_orf: false, noncoding: false,
+                seqname: String::new(),
+            });
+        }
+    } else {
+        for line in tsv.lines() {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 6 { continue; }
+            if let Some(&(start, end, strand)) = feat_map.get(p[0]) {
+                if !seen.insert((start, end)) { continue; }
+                results.push(core::Feature {
+                    start, end, strand,
+                    name: p[1].to_string(),
+                    locus_tag: String::new(),
+                    color_idx: results.len(),
+                    is_orf: false, noncoding: false,
+                    seqname: String::new(),
+                });
+            }
+        }
+    }
+
+    // Cleanup temp files
+    let _ = std::fs::remove_file(&query_file);
+    let _ = std::fs::remove_file(&out_tsv);
+    let _ = std::fs::remove_file(&db_dmnd);
+
+    Ok(results)
+}
+
+fn blast_completions(prefix: &str) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let expanded = if prefix.starts_with("~/") {
+        format!("{}{}", home, &prefix[1..])
+    } else {
+        prefix.to_string()
+    };
+    let (dir_part, file_prefix) = if expanded.ends_with('/') {
+        (expanded.clone(), String::new())
+    } else if let Some(pos) = expanded.rfind('/') {
+        (expanded[..=pos].to_string(), expanded[pos + 1..].to_string())
+    } else {
+        (String::from("./"), expanded.clone())
+    };
+    // Reconstruct display prefix using original (with ~)
+    let orig_dir = if prefix.starts_with("~/") {
+        if let Some(pos) = prefix.rfind('/') { prefix[..=pos].to_string() }
+        else { "~/".to_string() }
+    } else {
+        dir_part.clone()
+    };
+
+    let mut completions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir_part) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with('.') { continue; }
+            if fname.to_ascii_lowercase().starts_with(&file_prefix.to_ascii_lowercase()) {
+                let is_dir = entry.path().is_dir();
+                let full = if is_dir {
+                    format!("{}{}/", orig_dir, fname)
+                } else {
+                    format!("{}{}", orig_dir, fname)
+                };
+                completions.push(full);
+            }
+        }
+    }
+    completions.sort();
+    completions
+}
+
 fn handle_hover(app: &mut App, row: usize, col: usize) {
     let hit = app
         .hit_map
@@ -1192,6 +1513,30 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
             } else { (vec![], vec![], 1000, 0) }
         } else { (vec![], vec![], 1000, 0) };
 
+    // Stop codons: send viewport-context positions (±1 span) as 1-based u32, main genome only.
+    // Plasmids fall back to JS sequence-window scanning (they're typically small).
+    let (stop_codons_plus, stop_codons_minus) = if app.active_genome == 0 && !app.stop_codons.is_empty() {
+        let vs = app.active_view_start() as usize;
+        let ve = app.active_view_end() as usize;
+        let span = ve.saturating_sub(vs);
+        let ctx_s = vs.saturating_sub(span);
+        let ctx_e = ve + span;
+        let slice_for = |strand: char| -> Vec<Vec<u32>> {
+            (0u8..3).map(|fr| {
+                app.stop_codons.get(&(strand, fr))
+                    .map(|v| {
+                        let lo = v.partition_point(|&p| p < ctx_s);
+                        let hi = v.partition_point(|&p| p <= ctx_e);
+                        v[lo..hi].iter().map(|&p| p as u32).collect()
+                    })
+                    .unwrap_or_default()
+            }).collect()
+        };
+        (slice_for('+'), slice_for('-'))
+    } else {
+        (vec![vec![], vec![], vec![]], vec![vec![], vec![], vec![]])
+    };
+
     web.push(server::BrowserState {
         view_start:  app.active_view_start(),
         view_end:    app.active_view_end(),
@@ -1238,6 +1583,20 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         plasmid_sizes,
         plasmid_features,
         plasmid_gc_skew,
+        stop_codons_plus,
+        stop_codons_minus,
+        blast_features: app.blast_features.iter().map(|f| {
+            server::BrowserFeature {
+                name:      if f.name.is_empty() { f.locus_tag.clone() } else { f.name.clone() },
+                locus_tag: f.locus_tag.clone(),
+                start:     f.start,
+                end:       f.end,
+                strand:    f.strand,
+                color:     "#e6b800".to_string(),
+                noncoding: false,
+                is_orf:    false,
+            }
+        }).collect(),
     });
 }
 

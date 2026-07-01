@@ -23,7 +23,7 @@ function circOpt(id){return document.getElementById(id);}
 
 function circFetchKey(state) {
   if (!state) return null;
-  return JSON.stringify([state.genome_size, state.main_size, (state.plasmid_sizes||[])]);
+  return JSON.stringify([state.genome_size, state.main_size, (state.plasmid_sizes||[]), (state.blast_features||[]).length]);
 }
 
 // ── Fetch and render all genome maps ─────────────────────────────────────────
@@ -73,7 +73,7 @@ async function fetchAllCircMaps() {
     if (svgEl) {
       svgEl.removeAttribute('width');
       svgEl.removeAttribute('height');
-      svgEl.style.cssText = 'width:100%;height:auto;display:block;';
+      svgEl.style.cssText = 'width:min(100%,calc(100vh - 160px));height:auto;display:block;margin:0 auto;';
 
       // Title double-click → focus options
       const titleEl = svgEl.getElementById('circ-title-svg');

@@ -10,6 +10,9 @@ function connect() {
     try {
       const state=JSON.parse(ev.data);
       state.features.forEach((f,i)=>{f._idx=i;});
+      if (state.blast_features) {
+        state.blast_features.forEach((f,i)=>{f._idx=state.features.length+i;});
+      }
       lastState=state;
       if (!localMode) {localVS=state.view_start; localVE=state.view_end;}
       renderLocal();

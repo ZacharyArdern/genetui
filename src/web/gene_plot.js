@@ -13,6 +13,7 @@ async function initPyodide() {
     pyReady=true;
     document.getElementById('btn-render').disabled=false;
     if (lastState) scheduleAutoRender();
+    if (typeof window.updateFancyLayer === 'function') window.updateFancyLayer();
   } catch(err) {
     badge.textContent='py error'; badge.style.background='#da3633';
     setFigStatus('Pyodide error');

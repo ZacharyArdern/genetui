@@ -48,6 +48,7 @@ pub(super) struct VFeat {
     #[allow(dead_code)]
     pub is_orf: bool,
     pub noncoding: bool,
+    pub blast: bool,
 }
 
 pub(super) fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
@@ -82,6 +83,7 @@ pub(super) fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
 
     let vfeats: Vec<VFeat> = {
         let feats = app.active_features();
+        let n_reg = feats.len();
         let mut out = Vec::new();
         for (idx, f) in feats.iter().enumerate() {
             let fr = (if f.strand == '+' {
@@ -94,14 +96,29 @@ pub(super) fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
                 let ce = bp_to_col(f.end.min(genome_size));
                 out.push(VFeat { idx, cs, ce: ce.max(cs), fr, strand: f.strand,
                     name: f.name.clone(), color_idx: f.color_idx, is_orf: f.is_orf,
-                    noncoding: f.noncoding });
+                    noncoding: f.noncoding, blast: false });
             }
             if wrap_end > 0 && f.start <= wrap_end {
                 let cs = bp_to_col(f.start.max(1));
                 let ce = bp_to_col(f.end.min(wrap_end));
                 out.push(VFeat { idx, cs, ce: ce.max(cs), fr, strand: f.strand,
                     name: f.name.clone(), color_idx: f.color_idx, is_orf: f.is_orf,
-                    noncoding: f.noncoding });
+                    noncoding: f.noncoding, blast: false });
+            }
+        }
+        // Overlay blast hit features in yellow
+        for (bi, f) in app.blast_features.iter().enumerate() {
+            let fr = (if f.strand == '+' {
+                f.start.saturating_sub(1) % 3
+            } else {
+                f.end.saturating_sub(1) % 3
+            }) as usize;
+            if f.end >= view_start && f.start <= genome_size {
+                let cs = bp_to_col(f.start.max(view_start));
+                let ce = bp_to_col(f.end.min(genome_size));
+                out.push(VFeat { idx: n_reg + bi, cs, ce: ce.max(cs), fr, strand: f.strand,
+                    name: f.name.clone(), color_idx: 0, is_orf: false,
+                    noncoding: false, blast: true });
             }
         }
         out
@@ -265,7 +282,10 @@ pub(super) fn draw_gene_tracks(f: &mut Frame, app: &mut App, area: Rect) {
             let fw = (ce + 1).saturating_sub(cs).max(1);
             let is_selected = selected_feat == Some(vf.idx);
             let is_hovered  = hovered_feat  == Some(vf.idx);
-            let gene_col = if basic {
+            let gene_col = if vf.blast {
+                if is_selected || is_hovered { Color::Rgb(255, 230, 80) }
+                else { Color::Rgb(230, 180, 40) }
+            } else if basic {
                 if is_selected { Color::White }
                 else if is_hovered {
                     if vf.strand == '+' { Color::LightCyan } else { Color::LightYellow }

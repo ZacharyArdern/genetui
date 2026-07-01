@@ -142,6 +142,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.display_opts.show_plasmid_maps { genomemap::draw_plasmid_maps(f, app, plasmid_area); }
     info::draw_info_panel(f, app, info_area);
     info::draw_status(f, app, status_area);
-    if app.search_popup_open  { search::draw_search_popup(f, app); }
-    if app.display_menu_open  { search::draw_display_menu(f, app); }
+    if app.search_popup_open   { search::draw_search_popup(f, app); }
+    if app.display_menu_open   { search::draw_display_menu(f, app); }
+    if app.search_menu_open    { search::draw_search_menu(f, app); }
+    if app.blast_target_open   { search::draw_blast_target_menu(f, app); }
+    if app.blast_file_open && !app.blast_completions.is_empty() {
+        search::draw_blast_completions(f, app);
+    }
 }
