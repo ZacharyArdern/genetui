@@ -19,7 +19,7 @@ A fast terminal-based genome exploration tool written in Rust, with a live-synce
 ## Easy Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ZacharyArdern/genetui/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ZacharyArdern/genetui/master/install.sh | sh
 ```
 
 Installs the latest release binary to `~/.local/bin`. Supports **macOS (Apple Silicon)** and **Linux (x86\_64)**. For other platforms, [build from source](#building).
