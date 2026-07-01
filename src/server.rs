@@ -80,6 +80,7 @@ pub struct WebServer {
     switch_genome_cmd:  Arc<Mutex<Option<(usize, u64, u64)>>>,
     set_dmnd_cmd:       Arc<Mutex<Option<String>>>,
     complete_path_cmd:  Arc<Mutex<Option<String>>>,
+    run_diamond_cmd:    Arc<Mutex<Option<(String, bool)>>>,   // (query_fasta_path, use_6ft)
 }
 
 impl WebServer {
@@ -94,6 +95,7 @@ impl WebServer {
             switch_genome_cmd: Arc::new(Mutex::new(None)),
             set_dmnd_cmd:      Arc::new(Mutex::new(None)),
             complete_path_cmd: Arc::new(Mutex::new(None)),
+            run_diamond_cmd:   Arc::new(Mutex::new(None)),
         })
     }
 
@@ -119,6 +121,10 @@ impl WebServer {
 
     pub fn take_complete_path_cmd(&self) -> Option<String> {
         self.complete_path_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_run_diamond_cmd(&self) -> Option<(String, bool)> {
+        self.run_diamond_cmd.lock().ok()?.take()
     }
 
     /// Push new state to all connected browser clients (sync-safe, callable from event loop).
@@ -683,6 +689,13 @@ async fn handle_ws(socket: WebSocket, server: Arc<WebServer>) {
                                     }
                                 }
                             }
+                            if v["cmd"].as_str() == Some("run_diamond") {
+                                if let (Some(query), Some(use_6ft)) = (v["query"].as_str(), v["use_6ft"].as_bool()) {
+                                    if let Ok(mut cmd) = server.run_diamond_cmd.lock() {
+                                        *cmd = Some((query.to_string(), use_6ft));
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -933,12 +946,45 @@ body {
 
 <!-- Search overlay (opened by /) -->
 <div id="search-overlay" style="display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,0.55);align-items:flex-start;justify-content:center">
-  <div style="margin-top:80px;width:440px;background:#161b22;border:1px solid #58a6ff;border-radius:8px;padding:12px 14px;box-shadow:0 8px 32px rgba(0,0,0,0.7)">
-    <input id="browser-search" type="text" placeholder="search gene or position (e.g. 12000-15000)&#8230;"
-      style="width:100%;box-sizing:border-box;font-size:12px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:5px 9px;font-family:monospace;outline:none"
-      autocomplete="off" spellcheck="false">
-    <div id="browser-search-results" style="display:none;margin-top:4px;border:1px solid #30363d;border-radius:5px;overflow-y:auto;max-height:220px"></div>
-    <div style="font-size:10px;color:#484f58;margin-top:6px">&#8593;&#8595; navigate &nbsp;&#183;&nbsp; Enter confirm &nbsp;&#183;&nbsp; Esc close</div>
+  <div style="margin-top:80px;width:480px;background:#161b22;border:1px solid #58a6ff;border-radius:8px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.7)">
+    <!-- Tab strip -->
+    <div style="display:flex;border-bottom:1px solid #30363d">
+      <button id="stab-gene" onclick="switchSearchTab('gene')"
+        style="flex:1;padding:8px 0;background:#1f6feb;color:#fff;border:none;border-radius:0;cursor:pointer;font-size:12px;font-family:monospace">
+        / Gene &amp; Position
+      </button>
+      <button id="stab-dmnd" onclick="switchSearchTab('dmnd')"
+        style="flex:1;padding:8px 0;background:transparent;color:#8b949e;border:none;cursor:pointer;font-size:12px;font-family:monospace">
+        &#128300; DIAMOND blast
+      </button>
+    </div>
+    <!-- Gene / position pane -->
+    <div id="search-pane-gene" style="padding:12px 14px">
+      <input id="browser-search" type="text" placeholder="search gene or position (e.g. 12000-15000)&#8230;"
+        style="width:100%;box-sizing:border-box;font-size:12px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:5px 9px;font-family:monospace;outline:none"
+        autocomplete="off" spellcheck="false">
+      <div id="browser-search-results" style="display:none;margin-top:4px;border:1px solid #30363d;border-radius:5px;overflow-y:auto;max-height:220px"></div>
+      <div style="font-size:10px;color:#484f58;margin-top:6px">&#8593;&#8595; navigate &nbsp;&#183;&nbsp; Enter confirm &nbsp;&#183;&nbsp; Esc close</div>
+    </div>
+    <!-- DIAMOND blast pane -->
+    <div id="search-pane-dmnd" style="display:none;padding:12px 14px">
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px">Query FASTA (protein or nucleotide):</div>
+      <input id="dmnd-query-input" type="text" placeholder="path/to/query.fasta"
+        style="width:100%;box-sizing:border-box;font-size:12px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:5px 9px;font-family:monospace;outline:none"
+        autocomplete="off" spellcheck="false">
+      <div id="dmnd-query-completions" style="display:none;margin-top:3px;border:1px solid #30363d;border-radius:5px;overflow-y:auto;max-height:140px"></div>
+      <div style="font-size:11px;color:#8b949e;margin:10px 0 5px">Search against:</div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;cursor:pointer;margin-bottom:5px">
+        <input type="radio" name="dmnd-target" id="dmnd-t0" value="0" checked style="accent-color:#58a6ff"> 6-frame translation (blastx)
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;cursor:pointer;margin-bottom:12px">
+        <input type="radio" name="dmnd-target" id="dmnd-t1" value="1" style="accent-color:#58a6ff"> Annotated gene proteins (blastp)
+      </label>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button id="btn-run-dmnd" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:5px 16px;font-size:12px;cursor:pointer">&#9654; Run DIAMOND</button>
+        <span style="font-size:10px;color:#484f58">Tab: complete path &nbsp;&#183;&nbsp; Enter: run &nbsp;&#183;&nbsp; Esc: close</span>
+      </div>
+    </div>
   </div>
 </div>
 

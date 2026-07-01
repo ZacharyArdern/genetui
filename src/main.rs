@@ -497,6 +497,14 @@ async fn run_loop(
             push_browser_state(app, web);
         }
 
+        // Handle browser: run DIAMOND blast (query path + 6ft flag sent from search overlay)
+        if let Some((query, use_6ft)) = web.take_run_diamond_cmd() {
+            app.blast_file_path = query;
+            app.blast_target_idx = if use_6ft { 0 } else { 1 };
+            start_diamond(app, &mut diamond_rx).await;
+            push_browser_state(app, web);
+        }
+
         // Render protein image before draw so the frame is never blank.
         if let Some(ref panel) = app.protein {
             if !panel.atoms.is_empty() && panel.img_cache.is_none() {

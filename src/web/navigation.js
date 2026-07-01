@@ -158,7 +158,25 @@ document.addEventListener('keydown', e => {
 
 window.addEventListener('resize', renderLocal);
 
-// ── Browser gene / coordinate search (overlay, opened by /) ──────────────────
+// ── Search overlay (gene/position + DIAMOND blast) ────────────────────────────
+// Tab switching
+window.switchSearchTab = function(tab) {
+  const isGene = tab === 'gene';
+  const tG = document.getElementById('stab-gene');
+  const tD = document.getElementById('stab-dmnd');
+  tG.style.background = isGene ? '#1f6feb' : 'transparent';
+  tG.style.color      = isGene ? '#fff'    : '#8b949e';
+  tD.style.background = isGene ? 'transparent' : '#1f6feb';
+  tD.style.color      = isGene ? '#8b949e'     : '#fff';
+  document.getElementById('search-pane-gene').style.display = isGene ? '' : 'none';
+  document.getElementById('search-pane-dmnd').style.display = isGene ? 'none' : '';
+  if (isGene) {
+    const i = document.getElementById('browser-search'); i.focus(); i.select();
+  } else {
+    document.getElementById('dmnd-query-input').focus();
+  }
+};
+
 (function() {
   const overlay = document.getElementById('search-overlay');
   const inp     = document.getElementById('browser-search');
@@ -170,12 +188,14 @@ window.addEventListener('resize', renderLocal);
     res.style.display='none';
     inp.value='';
     searchHits=[];
+    const qR = document.getElementById('dmnd-query-completions');
+    if (qR) qR.style.display='none';
     window.hoveredPanel='genome';
   }
 
   window.openSearchOverlay = function() {
     overlay.style.display='flex';
-    inp.focus(); inp.select();
+    switchSearchTab('gene');
     window.hoveredPanel='search';
   };
 
@@ -263,6 +283,63 @@ window.addEventListener('resize', renderLocal);
       searchIdx = Math.max(searchIdx-1, 0); renderDropdown(); e.preventDefault();
     }
   });
+
+  // ── DIAMOND blast pane ──────────────────────────────────────────────────────
+  const qInp = document.getElementById('dmnd-query-input');
+  const qRes = document.getElementById('dmnd-query-completions');
+  let qComps = [], qCompIdx = 0;
+
+  function renderQComps() {
+    qRes.innerHTML = qComps.map((p,i) => {
+      const bg = i===qCompIdx ? '#1f6feb' : 'transparent';
+      return `<div data-qi="${i}" style="padding:3px 10px;cursor:pointer;background:${bg};color:#c9d1d9;font-family:monospace;font-size:11px">${esc(p)}</div>`;
+    }).join('');
+    qRes.querySelectorAll('[data-qi]').forEach(el => {
+      el.addEventListener('mousedown', ev => {
+        ev.preventDefault();
+        qInp.value = qComps[parseInt(el.dataset.qi)];
+        qRes.style.display='none'; qComps=[];
+      });
+    });
+  }
+
+  // Called by onStatusUpdate in gene_info.js when path_completions arrive
+  window._updateDmndQueryComps = function(list) {
+    if (document.getElementById('search-pane-dmnd').style.display === 'none') return;
+    qComps = list; qCompIdx = 0;
+    if (!list.length) { qRes.style.display='none'; return; }
+    qRes.style.display='block';
+    renderQComps();
+  };
+
+  function runDmnd() {
+    const query = (qComps.length ? qComps[qCompIdx] : null) || qInp.value.trim();
+    if (!query) return;
+    const use6ft = document.getElementById('dmnd-t0').checked;
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({cmd: 'run_diamond', query, use_6ft: use6ft}));
+    closeSearch();
+  }
+
+  qInp.addEventListener('input', () => {
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({cmd: 'complete_path', prefix: qInp.value}));
+  });
+  qInp.addEventListener('keydown', e => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      if (qComps.length) { qInp.value = qComps[qCompIdx]; qRes.style.display='none'; qComps=[]; }
+      if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({cmd: 'complete_path', prefix: qInp.value}));
+    } else if (e.key === 'Enter') { e.preventDefault(); runDmnd(); }
+    else if (e.key === 'Escape') { closeSearch(); }
+    else if (e.key === 'ArrowDown' && qComps.length) {
+      qCompIdx = Math.min(qCompIdx+1, qComps.length-1); renderQComps(); e.preventDefault();
+    } else if (e.key === 'ArrowUp' && qComps.length) {
+      qCompIdx = Math.max(qCompIdx-1, 0); renderQComps(); e.preventDefault();
+    }
+  });
+  document.getElementById('btn-run-dmnd').addEventListener('click', runDmnd);
 })();
 
 // ── Vertical drag-resize (live-panel height) ──────────────────────────────────
