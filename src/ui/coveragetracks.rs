@@ -8,9 +8,25 @@ use ratatui::{
 
 use crate::app::App;
 
-pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: char) {
-    let cov = match &app.coverage {
-        Some(c) => c,
+// (base_r, base_g, base_b, hi_r, hi_g, hi_b) per track index
+const PLUS_PALETTE: &[(u8,u8,u8,u8,u8,u8)] = &[
+    (15, 40, 50,  72, 210, 180),  // teal
+    (10, 40, 15,  50, 200,  80),  // green
+    (30, 10, 50, 140,  60, 210),  // purple
+    (40, 10, 10, 220,  70,  70),  // red
+];
+const MINUS_PALETTE: &[(u8,u8,u8,u8,u8,u8)] = &[
+    (40, 20, 10, 240, 148,  50),  // orange
+    (40, 10, 30, 220,  60, 150),  // pink
+    (40, 35,  5, 200, 180,  30),  // yellow
+    (10, 30, 40,  40, 160, 200),  // blue
+];
+const BASIC_PLUS:  &[Color] = &[Color::Cyan,    Color::Green,   Color::Blue,  Color::White];
+const BASIC_MINUS: &[Color] = &[Color::Yellow,  Color::Magenta, Color::Red,   Color::LightYellow];
+
+pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: char, track_idx: usize) {
+    let cov = match app.coverages.get(track_idx) {
+        Some((_, c)) => c,
         None => return,
     };
     let width  = area.width  as usize;
@@ -28,7 +44,6 @@ pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: 
     if span <= 0.0 { return; }
 
     let data = if strand == '+' { &cov.plus } else { &cov.minus };
-    let _bin_size = cov.bin_size as f64;
 
     let mut col_max = vec![0u32; feat_w];
     let wrap_end: u64 = if view_end > genome_size { view_end - genome_size } else { 0 };
@@ -63,11 +78,13 @@ pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: 
     let levels = height;
 
     let basic = app.basic_mode;
+    let ti = track_idx % PLUS_PALETTE.len();
     let (base_r, base_g, base_b, hi_r, hi_g, hi_b) = if strand == '+' {
-        (15u8, 40u8, 50u8, 72u8, 210u8, 180u8)
+        PLUS_PALETTE[ti]
     } else {
-        (40u8, 20u8, 10u8, 240u8, 148u8, 50u8)
+        MINUS_PALETTE[ti]
     };
+    let basic_hi = if strand == '+' { BASIC_PLUS[ti] } else { BASIC_MINUS[ti] };
 
     let fmt_cov = |n: f64| -> String {
         if n >= 1_000_000.0      { format!("{:.0}M", n / 1_000_000.0) }
@@ -93,11 +110,12 @@ pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: 
             };
             format!("{:>4}", fmt_cov(threshold.max(0.0)))
         };
-        let label_color = if row == label_row {
-            if strand == '+' { Color::Rgb(72, 210, 180) } else { Color::Rgb(240, 148, 50) }
+        let hi_color = if basic {
+            basic_hi
         } else {
-            Color::DarkGray
+            Color::Rgb(hi_r, hi_g, hi_b)
         };
+        let label_color = if row == label_row { hi_color } else { Color::DarkGray };
         spans.push(Span::styled(label, Style::default().fg(label_color)));
         spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
 
@@ -111,8 +129,7 @@ pub(super) fn draw_coverage_track(f: &mut Frame, app: &App, area: Rect, strand: 
             };
             if basic {
                 let (ch, color) = if is_filled {
-                    let hi = if strand == '+' { Color::Cyan } else { Color::Yellow };
-                    ('█', hi)
+                    ('█', basic_hi)
                 } else {
                     (' ', Color::Reset)
                 };

@@ -139,6 +139,11 @@ document.addEventListener('keydown', e => {
     window.close();
     return;
   }
+  if (e.key === 'u' || e.key === 'U') {
+    e.preventDefault();
+    openUploadBamOverlay();
+    return;
+  }
   const span=localVE-localVS, step=Math.max(1,Math.round(span*.12));
   let changed=true;
   switch(e.key) {
@@ -157,6 +162,108 @@ document.addEventListener('keydown', e => {
 });
 
 window.addEventListener('resize', renderLocal);
+
+// ── Upload BAM overlay (u key) ────────────────────────────────────────────────
+let _uploadBamComps = [], _uploadBamCompIdx = 0;
+
+function openUploadBamOverlay() {
+  let overlay = document.getElementById('upload-bam-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'upload-bam-overlay';
+    overlay.style.cssText = 'display:none;position:fixed;inset:0;z-index:600;background:rgba(0,0,0,0.55);'
+      + 'align-items:flex-start;justify-content:center';
+    overlay.innerHTML =
+      `<div style="margin-top:120px;width:520px;background:#161b22;border:1px solid #3fb950;`
+      + `border-radius:8px;overflow:visible;box-shadow:0 8px 32px rgba(0,0,0,0.7);padding:16px">`
+      + `<div style="color:#3fb950;font-size:13px;font-family:monospace;margin-bottom:10px">Upload BAM / SAM / CRAM</div>`
+      + `<input id="upload-bam-input" type="text" placeholder="path/to/file.bam" autocomplete="off"`
+      + ` style="width:100%;box-sizing:border-box;background:#0d1117;color:#e6edf3;border:1px solid #3fb950;`
+      + `border-radius:4px;padding:6px 10px;font-size:13px;font-family:monospace">`
+      + `<div id="upload-bam-comps" style="position:absolute;left:16px;right:16px;background:#1c2128;`
+      + `border:1px solid #3fb950;border-radius:4px;max-height:200px;overflow-y:auto;`
+      + `font-size:12px;font-family:monospace;display:none;z-index:10"></div>`
+      + `<div style="color:#6e7681;font-size:11px;font-family:monospace;margin-top:8px">`
+      + `Tab: complete · Enter: load · Esc: cancel</div>`
+      + `</div>`;
+    document.body.appendChild(overlay);
+
+    const inp = overlay.querySelector('#upload-bam-input');
+    const compsEl = overlay.querySelector('#upload-bam-comps');
+
+    function renderComps() {
+      compsEl.innerHTML = _uploadBamComps.map((p, i) => {
+        const bg = i === _uploadBamCompIdx ? '#1f6feb' : 'transparent';
+        return `<div data-ci="${i}" style="padding:3px 10px;cursor:pointer;background:${bg};color:#e6edf3">${esc(p)}</div>`;
+      }).join('');
+      compsEl.querySelectorAll('[data-ci]').forEach(el => {
+        el.addEventListener('mousedown', ev => {
+          ev.preventDefault();
+          inp.value = _uploadBamComps[parseInt(el.dataset.ci)];
+          compsEl.style.display = 'none';
+          _uploadBamComps = [];
+          inp.focus();
+        });
+      });
+      compsEl.style.display = _uploadBamComps.length ? 'block' : 'none';
+    }
+
+    inp.addEventListener('input', () => {
+      if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({cmd: 'complete_path', prefix: inp.value}));
+    });
+
+    inp.addEventListener('keydown', ev => {
+      if (ev.key === 'Tab') {
+        ev.preventDefault();
+        if (_uploadBamComps.length) {
+          inp.value = _uploadBamComps[_uploadBamCompIdx];
+          _uploadBamComps = []; compsEl.style.display = 'none';
+        }
+        if (ws && ws.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({cmd: 'complete_path', prefix: inp.value}));
+      } else if (ev.key === 'Enter') {
+        ev.preventDefault();
+        const path = (_uploadBamComps.length ? _uploadBamComps[_uploadBamCompIdx] : null) || inp.value.trim();
+        if (path && ws && ws.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({cmd: 'upload_bam', path}));
+        closeUploadBamOverlay();
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeUploadBamOverlay();
+      } else if (ev.key === 'ArrowDown' && _uploadBamComps.length) {
+        _uploadBamCompIdx = Math.min(_uploadBamCompIdx + 1, _uploadBamComps.length - 1);
+        renderComps(); ev.preventDefault();
+      } else if (ev.key === 'ArrowUp' && _uploadBamComps.length) {
+        _uploadBamCompIdx = Math.max(_uploadBamCompIdx - 1, 0);
+        renderComps(); ev.preventDefault();
+      }
+    });
+
+    inp.addEventListener('blur', () => {
+      setTimeout(() => { compsEl.style.display = 'none'; }, 150);
+    });
+
+    overlay.addEventListener('mousedown', ev => {
+      if (ev.target === overlay) closeUploadBamOverlay();
+    });
+
+    window._updateUploadBamComps = function(list) {
+      _uploadBamComps = list; _uploadBamCompIdx = 0; renderComps();
+    };
+  }
+  _uploadBamComps = []; _uploadBamCompIdx = 0;
+  overlay.style.display = 'flex';
+  const inp = overlay.querySelector('#upload-bam-input');
+  inp.value = '';
+  inp.focus();
+}
+
+function closeUploadBamOverlay() {
+  const overlay = document.getElementById('upload-bam-overlay');
+  if (overlay) overlay.style.display = 'none';
+  _uploadBamComps = [];
+}
 
 // ── Search overlay (gene/position + DIAMOND blast) ────────────────────────────
 // Tab switching

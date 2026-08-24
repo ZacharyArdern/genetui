@@ -25,12 +25,19 @@ pub struct BrowserState {
     pub seq_start: u64,         // genomic offset of sequence[0]
     pub protein_pdb: String,    // raw PDB text of selected+folded protein (may be empty)
     pub protein_name: String,   // gene name for the PDB
-    pub coverage_plus:      Vec<u32>,   // per-bin read depth, plus strand
-    pub coverage_minus:     Vec<u32>,   // per-bin read depth, minus strand
-    pub coverage_bin_size:  u64,        // bp per bin
-    pub coverage_bin_start: u64,        // genomic position of first bin
-    pub reads_plus:  Vec<[u32; 2]>,    // per-read [start, end], + strand (only when zoomed in)
-    pub reads_minus: Vec<[u32; 2]>,    // per-read [start, end], - strand
+    pub coverage_plus:      Vec<Vec<u32>>,   // [track][bin] read depth, plus strand
+    pub coverage_minus:     Vec<Vec<u32>>,   // [track][bin] read depth, minus strand
+    pub coverage_bin_size:  u64,             // bp per bin
+    pub coverage_bin_start: u64,             // genomic position of first bin
+    pub reads_plus:  Vec<Vec<[u32; 2]>>,    // [track][read] [start, end], + strand
+    pub reads_minus: Vec<Vec<[u32; 2]>>,    // [track][read] [start, end], - strand
+    pub bam_labels:  Vec<String>,            // display name per track
+    pub genome_label:       String,
+    pub gff_label:          String,
+    pub extra_gff_labels:   Vec<String>,
+    pub extra_gff_features: Vec<Vec<BrowserFeature>>,
+    pub active_bam_mask:    Vec<bool>,
+    pub gff_overlay:        bool,
     pub input_files: Vec<String>,       // source file paths (gff, fasta, bam)
     pub msa_gene: String,               // gene name for the active MSA (empty = none)
     pub msa_sequences: Vec<[String; 2]>,// [(id, aligned_sequence), …]
@@ -81,6 +88,10 @@ pub struct WebServer {
     set_dmnd_cmd:       Arc<Mutex<Option<String>>>,
     complete_path_cmd:  Arc<Mutex<Option<String>>>,
     run_diamond_cmd:    Arc<Mutex<Option<(String, bool)>>>,   // (query_fasta_path, use_6ft)
+    upload_bam_cmd:     Arc<Mutex<Option<String>>>,           // path to BAM to add
+    toggle_bam_cmd:      Arc<Mutex<Option<usize>>>,
+    set_gff_overlay_cmd: Arc<Mutex<Option<bool>>>,
+    upload_file_cmd:     Arc<Mutex<Option<String>>>,
 }
 
 impl WebServer {
@@ -96,6 +107,10 @@ impl WebServer {
             set_dmnd_cmd:      Arc::new(Mutex::new(None)),
             complete_path_cmd: Arc::new(Mutex::new(None)),
             run_diamond_cmd:   Arc::new(Mutex::new(None)),
+            upload_bam_cmd:    Arc::new(Mutex::new(None)),
+            toggle_bam_cmd:      Arc::new(Mutex::new(None)),
+            set_gff_overlay_cmd: Arc::new(Mutex::new(None)),
+            upload_file_cmd:     Arc::new(Mutex::new(None)),
         })
     }
 
@@ -125,6 +140,22 @@ impl WebServer {
 
     pub fn take_run_diamond_cmd(&self) -> Option<(String, bool)> {
         self.run_diamond_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_upload_bam_cmd(&self) -> Option<String> {
+        self.upload_bam_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_toggle_bam_cmd(&self) -> Option<usize> {
+        self.toggle_bam_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_set_gff_overlay_cmd(&self) -> Option<bool> {
+        self.set_gff_overlay_cmd.lock().ok()?.take()
+    }
+
+    pub fn take_upload_file_cmd(&self) -> Option<String> {
+        self.upload_file_cmd.lock().ok()?.take()
     }
 
     /// Push new state to all connected browser clients (sync-safe, callable from event loop).
@@ -696,6 +727,28 @@ async fn handle_ws(socket: WebSocket, server: Arc<WebServer>) {
                                     }
                                 }
                             }
+                            if v["cmd"].as_str() == Some("upload_bam") {
+                                if let Some(path) = v["path"].as_str() {
+                                    if let Ok(mut cmd) = server.upload_bam_cmd.lock() {
+                                        *cmd = Some(path.to_string());
+                                    }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("toggle_bam") {
+                                if let Some(idx) = v["idx"].as_u64() {
+                                    if let Ok(mut cmd) = server.toggle_bam_cmd.lock() { *cmd = Some(idx as usize); }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("set_gff_overlay") {
+                                if let Some(b) = v["overlay"].as_bool() {
+                                    if let Ok(mut cmd) = server.set_gff_overlay_cmd.lock() { *cmd = Some(b); }
+                                }
+                            }
+                            if v["cmd"].as_str() == Some("upload_file") {
+                                if let Some(path) = v["path"].as_str() {
+                                    if let Ok(mut cmd) = server.upload_file_cmd.lock() { *cmd = Some(path.to_string()); }
+                                }
+                            }
                         }
                     }
                     _ => {}
@@ -909,14 +962,16 @@ body {
   display: none;
 }
 
-/* ── Options dropdown ────────────────────────────────────────────────────── */
-#opts-box {
+/* ── Options / Files dropdowns ───────────────────────────────────────────── */
+#opts-box, #files-box {
   position: fixed; z-index: 300;
   background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-  padding: 14px 16px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+  padding: 14px 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
   cursor: default; user-select: none;
 }
-#opts-box h3 { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+#opts-box { width: 380px; }
+#files-box { width: 260px; }
+#opts-box h3, #files-box h3 { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; cursor: move; }
 .og { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; }
 .cr { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #8b949e; }
 .cr label { white-space: nowrap; }
@@ -1118,10 +1173,12 @@ body {
       <span id="fig-bar-label">Custom gene plot</span>
       <span id="fig-status">loading Pyodide…</span>
       <div style="margin-left:auto;display:flex;gap:5px">
+        <button class="dbtn" id="btn-files">&#128193; Files</button>
         <button class="dbtn" id="btn-opts">&#9881; Options</button>
         <button class="dbtn" id="btn-render" disabled>Render</button>
         <button class="dbtn" id="btn-svg"   disabled>SVG</button>
         <button class="dbtn" id="btn-png"   disabled>PNG 600dpi</button>
+        <button class="dbtn" id="btn-pdf"   disabled>PDF</button>
         <button class="dbtn" id="btn-py"    disabled>Download code</button>
       </div>
     </div>
@@ -1179,7 +1236,14 @@ body {
         <option value="none">None</option>
         <option value="histogram">Histogram</option>
         <option value="kernel">Kernel (smoothed)</option>
-        <option value="reads">Raw reads</option>
+        <option value="reads" selected>Raw reads</option>
+      </select>
+    </div>
+    <div class="cr" style="grid-column:1/-1" id="cov-layout-row">
+      <label for="cov-layout">Multi-BAM layout</label>
+      <select id="cov-layout">
+        <option value="stack">Stack (separate tracks)</option>
+        <option value="overlay">Overlay (one track)</option>
       </select>
     </div>
     <div class="cr" style="grid-column:1/-1" id="cov-height-row" style="display:none">
@@ -1234,9 +1298,51 @@ body {
         <option value="none">None</option>
         <option value="histogram">Histogram</option>
         <option value="kernel">Kernel (smoothed)</option>
-        <option value="reads">Raw reads</option>
+        <option value="reads" selected>Raw reads</option>
+        <option value="barplot">Barplot (reads)</option>
       </select>
     </div>
+    <div class="cr">
+      <label for="fig-cov-layout">Multi-BAM layout</label>
+      <select id="fig-cov-layout">
+        <option value="stack">Stack</option>
+        <option value="overlay" selected>Overlay</option>
+      </select>
+    </div>
+    <div class="cr">
+      <label for="fig-coord-dp">Coord precision</label>
+      <select id="fig-coord-dp">
+        <option value="0">Auto</option>
+        <option value="2">2 d.p.</option>
+        <option value="3">3 d.p.</option>
+        <option value="4">4 d.p.</option>
+      </select>
+    </div>
+    <div class="cr">
+      <label for="fig-cov-log">Cov log₁₀</label>
+      <input type="checkbox" id="fig-cov-log" checked>
+    </div>
+    <div class="cr">
+      <label for="fig-cov-ymax">Cov y-max</label>
+      <input type="number" id="fig-cov-ymax" min="0" step="any" placeholder="auto"
+        style="width:64px;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:3px;padding:2px 4px;font-size:11px">
+    </div>
+    <div class="cr" style="grid-column:1/-1">
+      <label for="fig-codon-lines" style="min-width:90px">Codon lines</label>
+      <input type="text" id="fig-codon-lines" placeholder="ATG:#f00, TAG:#00f"
+        style="flex:1;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:3px;padding:2px 6px;font-size:11px;font-family:monospace">
+    </div>
+    <div style="grid-column:1/-1" id="fig-codon-col-pickers"></div>
+  </div>
+</div>
+
+<!-- Loaded files dropdown -->
+<div id="files-box" style="display:none">
+  <h3>Loaded files</h3>
+  <div id="loaded-files-list" style="font-size:11px;font-family:monospace;line-height:1.9"></div>
+  <div style="margin-top:10px">
+    <button id="btn-add-file" onclick="openAddFileOverlay()"
+      style="font-size:11px;padding:3px 10px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer">+ Add file</button>
   </div>
 </div>
 

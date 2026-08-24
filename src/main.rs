@@ -39,9 +39,9 @@ struct Cli {
     #[arg(long, hide = true)]
     out_dir: Option<String>,
 
-    /// BAM/SAM/CRAM file for coverage (alternative to positional)
-    #[arg(long)]
-    bam: Option<String>,
+    /// BAM/SAM/CRAM file(s) for coverage; may be repeated for multiple tracks
+    #[arg(long, num_args = 1, action = clap::ArgAction::Append)]
+    bam: Vec<String>,
 
     /// Path to DIAMOND database (.dmnd) for homolog search
     #[arg(long)]
@@ -83,10 +83,10 @@ fn find_famsa(explicit: Option<String>) -> Option<String> {
     None
 }
 
-fn classify_files(cli: &Cli) -> (Option<String>, Option<String>, Option<String>) {
+fn classify_files(cli: &Cli) -> (Option<String>, Option<String>, Vec<String>) {
     let mut fasta: Option<String> = None;
     let mut gff:   Option<String> = None;
-    let mut bam:   Option<String> = cli.bam.clone();
+    let mut bams:  Vec<String>    = cli.bam.clone();
     for path in &cli.files {
         let lower = path.to_ascii_lowercase();
         let ext = lower.trim_end_matches(".gz");
@@ -96,18 +96,18 @@ fn classify_files(cli: &Cli) -> (Option<String>, Option<String>, Option<String>)
                || ext.ends_with(".fas") || ext.ends_with(".faa") {
             fasta = Some(path.clone());
         } else if ext.ends_with(".bam") || ext.ends_with(".sam") || ext.ends_with(".cram") {
-            bam = Some(path.clone());
+            bams.push(path.clone());
         } else {
             eprintln!("Warning: unrecognised file extension, skipping: {path}");
         }
     }
-    (fasta, gff, bam)
+    (fasta, gff, bams)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (fasta_path, gff_path, mut bam_path) = classify_files(&cli);
+    let (fasta_path, gff_path, bam_paths_raw) = classify_files(&cli);
     let gff_path = gff_path.ok_or_else(|| anyhow::anyhow!("No GFF/GFF3 file provided"))?;
 
     // Build fold command: prefer --minifold_mlx path, fall back to `minifold` in PATH.
@@ -183,25 +183,27 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    // Ensure BAM is sorted+indexed; may return a different (sorted) path.
-    if let Some(ref bp) = bam_path {
-        match ensure_bam_index(bp) {
-            Ok(actual) => { bam_path = Some(actual); }
-            Err(e)     => { eprintln!("Warning: could not build BAM index: {e}"); }
+    // Ensure each BAM is sorted+indexed; collect (label, coverage) pairs.
+    let mut bam_paths: Vec<String> = Vec::new();
+    let mut coverages: Vec<(String, core::StrandCoverage)> = Vec::new();
+    for bp in bam_paths_raw {
+        let actual = match ensure_bam_index(&bp) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("Warning: could not build BAM index for {bp}: {e}"); continue; }
+        };
+        match compute_alignment_coverage(&actual, fasta_path.as_deref(), &seqname_offsets, genome_size) {
+            Ok(cov) => {
+                let label = std::path::Path::new(&actual)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(&actual).to_string();
+                coverages.push((label, cov));
+                bam_paths.push(actual);
+            }
+            Err(e) => { eprintln!("Warning: could not read BAM file {actual}: {e}"); }
         }
     }
 
-    let coverage = if let Some(ref bam_path) = bam_path {
-        match compute_alignment_coverage(bam_path, fasta_path.as_deref(), &seqname_offsets, genome_size) {
-            Ok(cov) => Some(cov),
-            Err(e) => {
-                eprintln!("Warning: could not read BAM file: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Initialize active_bams mask (all true)
+    let initial_active_bams = vec![true; coverages.len()];
 
     let fold_out_dir: Option<String> = if cli.pdbs.is_some() || cli.out_dir.is_some() || on_click_cmd.is_some() {
         Some(default_out_dir())
@@ -229,17 +231,18 @@ async fn main() -> Result<()> {
     };
     let famsa_bin = find_famsa(cli.famsa.clone());
 
-    let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverage, fold_out_dir, dmnd_db, famsa_bin);
-    app.bam_path = bam_path.clone();
+    let mut app = App::new(features, genome_size, genome_seq, genome_name, stop_codons, on_click_cmd, gc_skew, plasmids, coverages, fold_out_dir, dmnd_db, famsa_bin);
+    app.bam_paths = bam_paths.clone();
+    app.active_bams = initial_active_bams;
     app.seqname_offsets = seqname_offsets.clone();
     app.fold_predict_py = use_predict_py && app.on_click_cmd.is_some();
     app.basic_mode = cli.basic;
     if cli.basic {
         app.display_opts.show_legend = false;
     }
-    app.source_files = std::iter::once(Some(gff_path.clone()))
-        .chain([fasta_path.clone(), bam_path.clone()])
-        .filter_map(|p| p)
+    app.source_files = std::iter::once(gff_path.clone())
+        .chain(fasta_path.clone())
+        .chain(bam_paths.iter().cloned())
         .collect();
 
     const WEB_PORT: u16 = 7890;
@@ -275,6 +278,7 @@ async fn run_loop(
     let mut fold_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>> = None;
     let mut msa_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<(String, String)>>>> = None;
     let mut diamond_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<core::Feature>>>> = None;
+    let mut bam_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<(String, String, core::StrandCoverage)>>> = None;
 
     loop {
         // Expire old status messages
@@ -369,6 +373,28 @@ async fn run_loop(
         }
         if diamond_completed {
             push_browser_state(app, web);
+        }
+
+        // Poll for completed BAM upload
+        if let Some(ref mut rx) = bam_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    app.bam_loading = false;
+                    match result {
+                        Ok((path, label, cov)) => {
+                            app.bam_paths.push(path);
+                            app.coverages.push((label.clone(), cov));
+                            app.active_bams.push(true);
+                            app.set_status(format!("Loaded BAM: {}", label));
+                            push_browser_state(app, web);
+                        }
+                        Err(e) => { app.set_status(format!("BAM load error: {}", e)); }
+                    }
+                    bam_rx = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => { bam_rx = None; app.bam_loading = false; }
+            }
         }
 
         // Apply viewport commands from browser
@@ -497,6 +523,51 @@ async fn run_loop(
             push_browser_state(app, web);
         }
 
+        // Handle browser: upload BAM request
+        if let Some(path) = web.take_upload_bam_cmd() {
+            app.upload_file_path = path;
+            start_bam_upload(app, &mut bam_rx).await;
+            push_browser_state(app, web);
+        }
+
+        // Handle browser: toggle BAM track active state
+        if let Some(idx) = web.take_toggle_bam_cmd() {
+            if idx < app.active_bams.len() {
+                app.active_bams[idx] = !app.active_bams[idx];
+                push_browser_state(app, web);
+            }
+        }
+
+        // Handle browser: set GFF overlay mode
+        if let Some(overlay) = web.take_set_gff_overlay_cmd() {
+            app.gff_overlay = overlay;
+            push_browser_state(app, web);
+        }
+
+        // Handle browser: upload generic file (BAM, GFF, FASTA)
+        if let Some(path) = web.take_upload_file_cmd() {
+            let lower = path.to_lowercase();
+            let is_bam = lower.ends_with(".bam") || lower.ends_with(".sam") || lower.ends_with(".cram");
+            let is_gff = lower.ends_with(".gff") || lower.ends_with(".gff3") || lower.ends_with(".gtf")
+                || lower.ends_with(".gff.gz") || lower.ends_with(".gff3.gz");
+            let is_fasta = lower.ends_with(".fasta") || lower.ends_with(".fa") || lower.ends_with(".fna")
+                || lower.ends_with(".fasta.gz") || lower.ends_with(".fa.gz");
+            if is_bam {
+                app.upload_file_path = path;
+                start_bam_upload(app, &mut bam_rx).await;
+                push_browser_state(app, web);
+            } else if is_gff {
+                load_extra_gff(app, &path);
+                push_browser_state(app, web);
+            } else if is_fasta {
+                app.set_status("Cannot add genome: only one genome is supported at a time".to_string());
+                push_browser_state(app, web);
+            } else {
+                app.set_status(format!("Unrecognised file type: {}", path));
+                push_browser_state(app, web);
+            }
+        }
+
         // Handle browser: run DIAMOND blast (query path + 6ft flag sent from search overlay)
         if let Some((query, use_6ft)) = web.take_run_diamond_cmd() {
             app.blast_file_path = query;
@@ -621,6 +692,39 @@ async fn run_loop(
                             KeyCode::Char(c) => {
                                 app.blast_file_path.push(c);
                                 app.blast_completions.clear();
+                            }
+                            _ => {}
+                        }
+                    } else if app.upload_file_open {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.upload_file_open = false;
+                                app.upload_file_path.clear();
+                                app.upload_completions.clear();
+                            }
+                            KeyCode::Enter => {
+                                app.upload_file_open = false;
+                                app.upload_completions.clear();
+                                start_bam_upload(app, &mut bam_rx).await;
+                            }
+                            KeyCode::Backspace => {
+                                app.upload_file_path.pop();
+                                app.upload_completions.clear();
+                            }
+                            KeyCode::Tab => {
+                                if app.upload_completions.is_empty() {
+                                    app.upload_completions = blast_completions(&app.upload_file_path);
+                                    app.upload_completion_idx = 0;
+                                } else {
+                                    app.upload_completion_idx = (app.upload_completion_idx + 1) % app.upload_completions.len();
+                                }
+                                if !app.upload_completions.is_empty() {
+                                    app.upload_file_path = app.upload_completions[app.upload_completion_idx].clone();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app.upload_file_path.push(c);
+                                app.upload_completions.clear();
                             }
                             _ => {}
                         }
@@ -825,6 +929,12 @@ async fn run_loop(
                             }
                             KeyCode::Char('d') => {
                                 app.display_menu_open = true;
+                            }
+                            KeyCode::Char('u') => {
+                                app.upload_file_open = true;
+                                app.upload_file_path.clear();
+                                app.upload_completions.clear();
+                                app.upload_completion_idx = 0;
                             }
                             KeyCode::Char('q') => {
                                 break;
@@ -1129,6 +1239,87 @@ async fn start_msa_search(
         }.await;
         let _ = tx.send(result);
     });
+}
+
+async fn start_bam_upload(
+    app: &mut App,
+    bam_rx: &mut Option<tokio::sync::oneshot::Receiver<anyhow::Result<(String, String, core::StrandCoverage)>>>,
+) {
+    if app.bam_loading { return; }
+    let raw_path = app.upload_file_path.trim().to_string();
+    if raw_path.is_empty() {
+        app.set_status("Upload: no file specified");
+        return;
+    }
+    let expanded = if raw_path.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}{}", home, &raw_path[1..])
+    } else {
+        raw_path.clone()
+    };
+    if !std::path::Path::new(&expanded).exists() {
+        app.set_status(format!("Upload: file not found: {}", raw_path));
+        return;
+    }
+    // Resolve canonical path for dedup check (handles symlinks / relative paths)
+    let canonical = std::fs::canonicalize(&expanded).unwrap_or_else(|_| std::path::PathBuf::from(&expanded));
+    let already_loaded = app.bam_paths.iter().any(|p| {
+        std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p)) == canonical
+    });
+    if already_loaded {
+        app.set_status(format!("BAM already loaded: {}", raw_path));
+        return;
+    }
+    let seqname_offsets = app.seqname_offsets.clone();
+    let genome_size = app.genome_size;
+    let fasta_path = app.source_files.iter()
+        .find(|p| p.ends_with(".fasta") || p.ends_with(".fa") || p.ends_with(".fna"))
+        .cloned();
+
+    app.bam_loading = true;
+    app.set_status(format!("Loading BAM\u{2026}"));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *bam_rx = Some(rx);
+
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String, core::StrandCoverage)> {
+            let actual = ensure_bam_index(&expanded)?;
+            let cov = compute_alignment_coverage(&actual, fasta_path.as_deref(), &seqname_offsets, genome_size)?;
+            let label = std::path::Path::new(&actual)
+                .file_name().and_then(|n| n.to_str()).unwrap_or(&actual).to_string();
+            Ok((actual, label, cov))
+        }).await;
+        let _ = tx.send(result.unwrap_or_else(|e| Err(anyhow::anyhow!("task error: {}", e))));
+    });
+}
+
+fn load_extra_gff(app: &mut App, path: &str) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let expanded = if path.starts_with("~/") {
+        format!("{}{}", home, &path[1..])
+    } else {
+        path.to_string()
+    };
+    if !std::path::Path::new(&expanded).exists() {
+        app.set_status(format!("GFF not found: {}", path));
+        return;
+    }
+    match core::parse_gff(&expanded, &app.seqname_offsets) {
+        Ok((feats, _)) => {
+            if feats.is_empty() {
+                app.set_status(format!("GFF has no features matching loaded chromosomes: {}", path));
+                return;
+            }
+            let label = std::path::Path::new(&expanded)
+                .file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
+            let n = feats.len();
+            app.extra_gffs.push((label.clone(), feats));
+            app.source_files.push(expanded);
+            app.set_status(format!("Loaded GFF: {} ({} features)", label, n));
+        }
+        Err(e) => { app.set_status(format!("GFF parse error: {}", e)); }
+    }
 }
 
 async fn start_diamond(
@@ -1598,39 +1789,52 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         .map(|p| (p.pdb_raw.clone(), p.gene_name.clone()))
         .unwrap_or_default();
 
-    // Per-read data: fetch from indexed BAM when viewport is narrow enough
+    // Per-read data: fetch from each indexed BAM when viewport is narrow enough
     const READ_FETCH_BP: u64 = 50_000;
     let (reads_p, reads_m) = if app.active_genome == 0 {
-        if let Some(ref bam) = app.bam_path {
-            let vs = app.active_view_start();
-            let ve = app.active_view_end();
-            if ve.saturating_sub(vs) <= READ_FETCH_BP {
+        let vs = app.active_view_start();
+        let ve = app.active_view_end();
+        let narrow = ve.saturating_sub(vs) <= READ_FETCH_BP;
+        let mut rp_all: Vec<Vec<[u32; 2]>> = Vec::new();
+        let mut rm_all: Vec<Vec<[u32; 2]>> = Vec::new();
+        for bam in &app.bam_paths {
+            if narrow {
                 match fetch_reads_in_region(bam, &app.seqname_offsets, vs, ve, 8000) {
                     Ok(rds) => {
-                        let rp = rds.iter().filter(|r| !r.2).map(|r| [r.0, r.1]).collect();
-                        let rm = rds.iter().filter(|r|  r.2).map(|r| [r.0, r.1]).collect();
-                        (rp, rm)
+                        rp_all.push(rds.iter().filter(|r| !r.2).map(|r| [r.0, r.1]).collect());
+                        rm_all.push(rds.iter().filter(|r|  r.2).map(|r| [r.0, r.1]).collect());
                     }
-                    Err(_) => (vec![], vec![]),
+                    Err(_) => { rp_all.push(vec![]); rm_all.push(vec![]); }
                 }
-            } else { (vec![], vec![]) }
-        } else { (vec![], vec![]) }
+            } else {
+                rp_all.push(vec![]);
+                rm_all.push(vec![]);
+            }
+        }
+        (rp_all, rm_all)
     } else { (vec![], vec![]) };
 
-    // Coverage: send viewport-context bins for chromosome only
+    // Coverage: send viewport-context bins per track for chromosome only
     let (cov_plus, cov_minus, cov_bin_sz, cov_bin_start) =
-        if app.active_genome == 0 {
-            if let Some(ref cov) = app.coverage {
-                let bs   = cov.bin_size;
-                let vs   = app.active_view_start();
-                let ve   = app.active_view_end();
-                let span = ve.saturating_sub(vs);
-                let ctx_s = vs.saturating_sub(span);
-                let ctx_e = (ve + span).min(cov.genome_size);
+        if app.active_genome == 0 && !app.coverages.is_empty() {
+            let bs = app.coverages[0].1.bin_size;
+            let vs = app.active_view_start();
+            let ve = app.active_view_end();
+            let span = ve.saturating_sub(vs);
+            let ctx_s = vs.saturating_sub(span);
+            let ctx_e_base = ve + span;
+            let mut plus_tracks: Vec<Vec<u32>> = Vec::new();
+            let mut minus_tracks: Vec<Vec<u32>> = Vec::new();
+            let mut fb_global = 0usize;
+            for (_, cov) in &app.coverages {
+                let ctx_e = ctx_e_base.min(cov.genome_size);
                 let fb = (ctx_s / bs) as usize;
                 let lb = ((ctx_e / bs) as usize).min(cov.plus.len().saturating_sub(1));
-                (cov.plus[fb..=lb].to_vec(), cov.minus[fb..=lb].to_vec(), bs, fb as u64 * bs)
-            } else { (vec![], vec![], 1000, 0) }
+                if fb_global == 0 { fb_global = fb; }
+                plus_tracks.push(cov.plus[fb..=lb].to_vec());
+                minus_tracks.push(cov.minus[fb..=lb].to_vec());
+            }
+            (plus_tracks, minus_tracks, bs, fb_global as u64 * bs)
         } else { (vec![], vec![], 1000, 0) };
 
     // Stop codons: send viewport-context positions (±1 span) as 1-based u32, main genome only.
@@ -1681,6 +1885,19 @@ fn push_browser_state(app: &App, web: &server::WebServer) {
         coverage_bin_start: cov_bin_start,
         reads_plus:  reads_p,
         reads_minus: reads_m,
+        bam_labels:  app.coverages.iter().map(|(l, _)| l.clone()).collect(),
+        genome_label: app.source_files.iter()
+            .find(|p| { let l=p.to_lowercase(); l.ends_with(".fasta")||l.ends_with(".fa")||l.ends_with(".fna")||l.ends_with(".fasta.gz") })
+            .and_then(|p| std::path::Path::new(p).file_name()?.to_str().map(str::to_string))
+            .unwrap_or_default(),
+        gff_label: app.source_files.iter()
+            .find(|p| { let l=p.to_lowercase(); l.ends_with(".gff")||l.ends_with(".gff3")||l.ends_with(".gtf")||l.ends_with(".gff.gz") })
+            .and_then(|p| std::path::Path::new(p).file_name()?.to_str().map(str::to_string))
+            .unwrap_or_default(),
+        extra_gff_labels: app.extra_gffs.iter().map(|(l, _)| l.clone()).collect(),
+        extra_gff_features: app.extra_gffs.iter().map(|(_, feats)| feat_to_browser(feats)).collect(),
+        active_bam_mask: app.active_bams.clone(),
+        gff_overlay: app.gff_overlay,
         gc_skew: vec![],  // redundant with main_gc_skew/plasmid_gc_skew; kept for compatibility
         input_files: app.source_files.clone(),
         msa_gene: app.msa.as_ref()

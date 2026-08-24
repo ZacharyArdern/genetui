@@ -23,11 +23,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     const COV_H: u16 = 4;
-    let cov_shown   = app.coverage.is_some() && app.display_opts.show_coverage && app.active_genome == 0;
-    let cov_extra   = if cov_shown { COV_H * 2 } else { 0 };
+    let cov_shown   = !app.coverages.is_empty() && app.display_opts.show_coverage && app.active_genome == 0;
+    let n_cov       = if cov_shown { app.coverages.len() } else { 0 };
+    let cov_extra   = if cov_shown { COV_H * 2 * n_cov as u16 } else { 0 };
     let fixed_rows  = genetracks::TRACK_PHYS as u16 + 1 + 2 + 1 + cov_extra;
     let minimap_h   = MINIMAP_H.min(size.height.saturating_sub(fixed_rows));
-    let track_min   = genetracks::TRACK_PHYS as u16 + 1 + cov_extra;
+    let track_min   = genetracks::TRACK_PHYS as u16 + 1 + cov_extra.max(0);
 
     let msa_open = app.msa.is_some();
     let (track_constraint, msa_constraint) = if msa_open {
@@ -103,25 +104,38 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(ratatui::widgets::Block::default().style(ratatui::style::Style::default().bg(Color::Black)), track_area);
 
     if cov_shown && app.display_opts.show_gene_tracks {
+        // n_cov + tracks above genes, gene track, n_cov - tracks below
+        let mut constraints: Vec<Constraint> = Vec::new();
+        for _ in 0..n_cov { constraints.push(Constraint::Length(COV_H)); }
+        constraints.push(Constraint::Length(genetracks::TRACK_PHYS as u16));
+        for _ in 0..n_cov { constraints.push(Constraint::Length(COV_H)); }
+        constraints.push(Constraint::Min(0));
         let track_split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(COV_H),
-                Constraint::Length(genetracks::TRACK_PHYS as u16),
-                Constraint::Length(COV_H),
-                Constraint::Min(0),
-            ])
+            .constraints(constraints)
             .split(track_area);
-        coveragetracks::draw_coverage_track(f, app, track_split[0], '+');
-        genetracks::draw_gene_tracks(f, app, track_split[1]);
-        coveragetracks::draw_coverage_track(f, app, track_split[2], '-');
+        for i in 0..n_cov {
+            coveragetracks::draw_coverage_track(f, app, track_split[i], '+', i);
+        }
+        genetracks::draw_gene_tracks(f, app, track_split[n_cov]);
+        for i in 0..n_cov {
+            coveragetracks::draw_coverage_track(f, app, track_split[n_cov + 1 + i], '-', i);
+        }
     } else if cov_shown {
+        let mut constraints: Vec<Constraint> = Vec::new();
+        for _ in 0..n_cov { constraints.push(Constraint::Length(COV_H)); }
+        for _ in 0..n_cov { constraints.push(Constraint::Length(COV_H)); }
+        constraints.push(Constraint::Min(0));
         let track_split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(COV_H), Constraint::Length(COV_H), Constraint::Min(0)])
+            .constraints(constraints)
             .split(track_area);
-        coveragetracks::draw_coverage_track(f, app, track_split[0], '+');
-        coveragetracks::draw_coverage_track(f, app, track_split[1], '-');
+        for i in 0..n_cov {
+            coveragetracks::draw_coverage_track(f, app, track_split[i], '+', i);
+        }
+        for i in 0..n_cov {
+            coveragetracks::draw_coverage_track(f, app, track_split[n_cov + i], '-', i);
+        }
     } else if app.display_opts.show_gene_tracks {
         genetracks::draw_gene_tracks(f, app, track_area);
     }
@@ -148,5 +162,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.blast_target_open   { search::draw_blast_target_menu(f, app); }
     if app.blast_file_open && !app.blast_completions.is_empty() {
         search::draw_blast_completions(f, app);
+    }
+    if app.upload_file_open {
+        search::draw_upload_completions(f, app);
     }
 }

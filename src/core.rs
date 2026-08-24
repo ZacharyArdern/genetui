@@ -567,8 +567,9 @@ pub fn compute_alignment_coverage(
 ) -> Result<StrandCoverage> {
     use rust_htslib::bam::{Read, Reader};
 
-    const BIN: u64 = 1000;
-    let n = ((genome_size + BIN - 1) / BIN) as usize;
+    // Aim for ≤500 K bins; floor at 30 bp for high-resolution genomes.
+    let bin_sz: u64 = (genome_size / 500_000).max(30);
+    let n = ((genome_size + bin_sz - 1) / bin_sz) as usize;
     let mut plus  = vec![0u32; n];
     let mut minus = vec![0u32; n];
 
@@ -641,7 +642,7 @@ pub fn compute_alignment_coverage(
         };
         let pos = record.pos();
         if pos < 0 { continue; }
-        let bin = ((offset + pos as u64) / BIN) as usize;
+        let bin = ((offset + pos as u64) / bin_sz) as usize;
         if bin >= n { continue; }
         if record.is_reverse() {
             minus[bin] = minus[bin].saturating_add(1);
@@ -663,7 +664,7 @@ pub fn compute_alignment_coverage(
         eprintln!("Warning: coverage is all-zero — BAM/CRAM may be empty or reference names may not match.");
     }
 
-    Ok(StrandCoverage { plus, minus, bin_size: BIN, genome_size })
+    Ok(StrandCoverage { plus, minus, bin_size: bin_sz, genome_size })
 }
 
 /// Calculate a nice tick spacing for a ruler.

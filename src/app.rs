@@ -93,7 +93,7 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<usize>,  // indices into active_features()
     pub search_idx: usize,
-    pub coverage: Option<crate::core::StrandCoverage>,
+    pub coverages: Vec<(String, crate::core::StrandCoverage)>,
     pub display_opts: DisplayOpts,
     pub display_menu_open: bool,
     pub display_menu_idx: usize,
@@ -124,6 +124,12 @@ pub struct App {
     pub blast_completions: Vec<String>,
     pub blast_completion_idx: usize,
     pub blast_running: bool,
+    // Upload-file (BAM) picker
+    pub upload_file_open: bool,
+    pub upload_file_path: String,
+    pub upload_completions: Vec<String>,
+    pub upload_completion_idx: usize,
+    pub bam_loading: bool,
     pub blast_error: Option<String>,
     pub blast_features: Vec<crate::core::Feature>,
     /// Set when MSA is triggered from browser but no DIAMOND DB is configured.
@@ -150,10 +156,16 @@ pub struct App {
     pub pending_kitty: Option<Vec<u8>>,
     /// Set to true when img_cache changes so pending_kitty gets rebuilt.
     pub kitty_image_dirty: bool,
-    /// Path to BAM file (for per-viewport read fetching via IndexedReader).
-    pub bam_path: Option<String>,
+    /// Paths to BAM/SAM/CRAM files (one per loaded coverage track).
+    pub bam_paths: Vec<String>,
     /// Sequence name → global offset map (used for multi-contig BAM queries).
     pub seqname_offsets: HashMap<String, u64>,
+    /// Whether each BAM track is active (included in static figure).
+    pub active_bams: Vec<bool>,
+    /// Extra GFF annotation tracks loaded at runtime: (label, features).
+    pub extra_gffs: Vec<(String, Vec<crate::core::Feature>)>,
+    /// If true, extra GFFs are overlaid on the main gene track; if false, each gets its own panel.
+    pub gff_overlay: bool,
 }
 
 impl App {
@@ -166,7 +178,7 @@ impl App {
         on_click_cmd: Option<String>,
         gc_skew: Vec<f64>,
         plasmids: Vec<PlasmidData>,
-        coverage: Option<crate::core::StrandCoverage>,
+        coverages: Vec<(String, crate::core::StrandCoverage)>,
         fold_out_dir: Option<String>,
         dmnd_db: Option<String>,
         famsa_bin: Option<String>,
@@ -200,7 +212,7 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_idx: 0,
-            coverage,
+            coverages,
             display_opts: DisplayOpts::default(),
             display_menu_open: false,
             display_menu_idx: 0,
@@ -226,6 +238,11 @@ impl App {
             blast_completions: Vec::new(),
             blast_completion_idx: 0,
             blast_running: false,
+            upload_file_open: false,
+            upload_file_path: String::new(),
+            upload_completions: Vec::new(),
+            upload_completion_idx: 0,
+            bam_loading: false,
             blast_error: None,
             blast_features: Vec::new(),
             needs_dmnd_db: false,
@@ -241,8 +258,11 @@ impl App {
                 || std::env::var("TERM_PROGRAM").map(|t| t == "ghostty").unwrap_or(false),
             pending_kitty: None,
             kitty_image_dirty: false,
-            bam_path: None,
+            bam_paths: Vec::new(),
             seqname_offsets: HashMap::new(),
+            active_bams: Vec::new(),
+            extra_gffs: Vec::new(),
+            gff_overlay: true,
         }
     }
 
@@ -281,7 +301,7 @@ impl App {
     /// Toggle the display option currently highlighted in the menu.
     #[allow(unused_assignments)]
     pub fn toggle_display_opt(&mut self) {
-        let has_coverage  = self.coverage.is_some();
+        let has_coverage  = !self.coverages.is_empty();
         let has_plasmids  = !self.plasmids.is_empty();
         // Build same item list as the UI menu to resolve the index.
         let mut idx = 0;
@@ -298,6 +318,7 @@ impl App {
         item!(self.display_opts.show_legend,       true);
         item!(self.display_opts.show_gene_tracks,  true);
         item!(self.display_opts.show_coverage,     has_coverage);
+
         // "Structure panel" item: closing it = Esc on the protein panel.
         if self.protein.is_some() {
             if idx == self.display_menu_idx {
@@ -320,7 +341,7 @@ impl App {
     pub fn display_menu_item_count(&self) -> usize {
         let mut n = 3; // chr_map, legend, gene_tracks always present
         if !self.plasmids.is_empty() { n += 1; }
-        if self.coverage.is_some()   { n += 1; }
+        if !self.coverages.is_empty() { n += 1; }
         if self.protein.is_some()    { n += 1; }
         if self.msa.is_some()        { n += 1; }
         n

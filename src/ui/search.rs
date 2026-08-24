@@ -161,8 +161,50 @@ pub(super) fn draw_blast_completions(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+pub(super) fn draw_upload_completions(f: &mut Frame, app: &App) {
+    let comps = &app.upload_completions;
+    if comps.is_empty() { return; }
+    let max_rows = 8usize;
+    let visible = comps.len().min(max_rows);
+    let w: u16 = 52;
+    let h: u16 = visible as u16 + 2;
+    let total = f.area();
+    let x = total.width.saturating_sub(w + 2).min(2);
+    let y = total.height.saturating_sub(h + 3);
+    let popup = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, popup);
+
+    let bg  = Color::Rgb(20, 35, 25);
+    let sel = Color::Rgb(40, 90, 55);
+    let dim = Color::Rgb(80, 130, 90);
+    let fg  = Color::Rgb(200, 240, 210);
+
+    let offset = if app.upload_completion_idx >= max_rows {
+        app.upload_completion_idx + 1 - max_rows
+    } else { 0 };
+
+    let lines: Vec<Line> = (offset..offset + visible).map(|i| {
+        let row_bg = if i == app.upload_completion_idx { sel } else { bg };
+        let label = comps[i].as_str();
+        let label = if label.len() + 2 > w as usize {
+            let trim = label.len() - (w as usize - 3);
+            format!("\u{2026}{}", &label[trim..])
+        } else {
+            label.to_string()
+        };
+        Line::from(Span::styled(format!(" {}", label), Style::default().fg(fg).bg(row_bg)))
+    }).collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Upload file (Tab: complete) ")
+        .border_style(Style::default().fg(dim))
+        .style(Style::default().bg(bg));
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 pub(super) fn draw_display_menu(f: &mut Frame, app: &mut App) {
-    let has_coverage = app.coverage.is_some();
+    let has_coverage = !app.coverages.is_empty();
     let has_plasmids = !app.plasmids.is_empty();
 
     struct MenuItem { label: &'static str, checked: bool }

@@ -108,9 +108,17 @@ function onStatusUpdate() {
   const msaErr  = (lastState && lastState.msa_error)  || '';
   const comps   = (lastState && lastState.path_completions) || [];
 
-  // Route completions to the search overlay DIAMOND pane if it's open
+  // Route completions to whichever picker is open
   if (comps.length && typeof window._updateDmndQueryComps === 'function') {
     window._updateDmndQueryComps(comps);
+  }
+  if (comps.length && typeof window._updateUploadBamComps === 'function') {
+    const overlay = document.getElementById('upload-bam-overlay');
+    if (overlay && overlay.style.display !== 'none') window._updateUploadBamComps(comps);
+  }
+  if (comps.length && typeof window._updateAddFileComps === 'function') {
+    const overlay = document.getElementById('add-file-overlay');
+    if (overlay && overlay.style.display !== 'none') window._updateAddFileComps(comps);
   }
 
   if (needsDb) {
@@ -142,6 +150,7 @@ function onStatusUpdate() {
     _statusActive = false;
     renderGeneInfo(selectedGene);
   }
+  if (typeof window.renderFilesPanel === 'function') window.renderFilesPanel();
 }
 
 function geneFromIdx(idx) {

@@ -44,9 +44,15 @@ let lastSvgData = null, debounceTimer = null;
 let ws, reconnTimer, dragStart = null, dragVS0 = 0, dragVE0 = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fmt(n) {
-  if (n >= 1e6) return (n/1e6).toFixed(2)+' Mb';
-  if (n >= 1e3) return (n/1e3).toFixed(1)+' kb';
+function fmt(n, span) {
+  if (n >= 1e6) {
+    const dp = span != null ? (span < 1e4 ? 4 : span < 1e5 ? 3 : 2) : 2;
+    return (n/1e6).toFixed(dp)+' Mb';
+  }
+  if (n >= 1e3) {
+    const dp = span != null ? (span < 1e3 ? 3 : span < 1e4 ? 2 : 1) : 1;
+    return (n/1e3).toFixed(dp)+' kb';
+  }
   return n+' bp';
 }
 function trunc(s,n)  { return s.length<=n ? s : s.slice(0,n-1)+'\u2026'; }
@@ -125,16 +131,22 @@ function drawSVG(state, vs, ve) {
   }));
   const multiContig = contigs.length > 1;
   function posLabel(pos) {
-    if (!multiContig) return fmt(pos);
+    if (!multiContig) return fmt(pos, span);
     for (const c of contigs) {
       if (pos >= c.start && pos <= c.end) {
         const local = pos - c.start + 1;
-        if (local >= 1e6) return (local/1e6).toFixed(2)+'M';
-        if (local >= 1e3) return (local/1e3).toFixed(1)+'k';
+        if (local >= 1e6) {
+          const dp = span < 1e4 ? 4 : span < 1e5 ? 3 : 2;
+          return (local/1e6).toFixed(dp)+'M';
+        }
+        if (local >= 1e3) {
+          const dp = span < 1e3 ? 3 : span < 1e4 ? 2 : 1;
+          return (local/1e3).toFixed(dp)+'k';
+        }
         return local+'';
       }
     }
-    return fmt(pos); // in gap
+    return fmt(pos, span); // in gap
   }
   function inGap(pos) {
     if (!multiContig) return false;
@@ -143,7 +155,7 @@ function drawSVG(state, vs, ve) {
 
   document.getElementById('genome-name').textContent = genome_name || 'genome';
   document.getElementById('position').textContent =
-    `${fmt(vs)} \u2013 ${fmt(ve)}  (${fmt(span)})`;
+    `${fmt(vs, span)} \u2013 ${fmt(ve, span)}  (${fmt(span)})`;
 
   const out = [];
 
@@ -180,7 +192,7 @@ function drawSVG(state, vs, ve) {
 
   const yGeneTop = RULER_H + covH;
   window._fancyYGeneTop = yGeneTop;  // read by fancy_track.js for tile positioning
-  if (covH > 0) drawCoverageStrand(state, vs, ve, W, RULER_H, covH, true, out);
+  if (covH > 0) drawCoverageAllTracks(state, vs, ve, W, RULER_H, covH, true, out);
   else if (covStyle !== 'none' && !hasCovData) {
     out.push(`<rect x="0" y="${RULER_H}" width="${W}" height="20" fill="#0a0e18"/>`);
     out.push(`<text x="${W/2|0}" y="${RULER_H+13}" text-anchor="middle" font-size="10" fill="#3d4a5e" font-family="monospace">coverage: no BAM loaded (--bam reads.bam)</text>`);
@@ -194,7 +206,7 @@ function drawSVG(state, vs, ve) {
     geneBottom = drawSimple(features, vs, ve, W, scale, out, yGeneTop, hitOnly);
   }
 
-  if (covH > 0) drawCoverageStrand(state, vs, ve, W, geneBottom, covH, false, out);
+  if (covH > 0) drawCoverageAllTracks(state, vs, ve, W, geneBottom, covH, false, out);
 
   // Minimap
   if (genome_size > 0) {
